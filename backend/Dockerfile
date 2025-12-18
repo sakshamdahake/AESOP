@@ -1,11 +1,15 @@
-# 1. Builder Stage (Has uv installed to build the venv)
+# 1. Builder Stage
 FROM ghcr.io/astral-sh/uv:python3.12-bookworm-slim AS builder
 
 WORKDIR /app
 ENV UV_COMPILE_BYTECODE=1
 
+# [FIX] Tell uv to create the environment at /opt/venv directly
+ENV UV_PROJECT_ENVIRONMENT="/opt/venv"
+
 COPY pyproject.toml uv.lock ./
-# Install dependencies to /app/.venv
+
+# Install dependencies into /opt/venv
 RUN uv sync --frozen --no-install-project --no-dev
 
 # --- Runtime Stage ---
@@ -13,22 +17,23 @@ FROM python:3.12-slim-bookworm AS runtime
 
 WORKDIR /app
 
-# [CORRECTION IS HERE]
-# We copy 'uv' from the official tool image, NOT the builder.
-# This guarantees we get the binary from '/uv'.
+# 1. Copy uv binary
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /bin/uv
 
-# Copy the virtual environment from the builder
-COPY --from=builder /app/.venv /app/.venv
+# 2. [FIX] Copy the venv from the EXACT same path it was built in
+COPY --from=builder /opt/venv /opt/venv
 
-# Add venv and uv to PATH
-ENV PATH="/app/.venv/bin:$PATH"
+# 3. Add to PATH
+ENV PATH="/opt/venv/bin:$PATH"
 
+# Copy code
 COPY . .
 
-# --- Dev Stage (Hot Reloading) ---
+# --- Dev Stage ---
 FROM runtime AS dev
-# Now 'uv' exists in /bin/uv, so this command will work
+# Tell uv where the environment is (so it doesn't create a new one in /app/.venv)
+ENV UV_PROJECT_ENVIRONMENT="/opt/venv"
+# Re-sync dev dependencies
 RUN uv sync --frozen
 
 # --- Prod Stage ---
