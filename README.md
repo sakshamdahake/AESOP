@@ -53,6 +53,8 @@ NEO4J_PASSWORD=aesop_graph_pass
 
 ### 3. Launch the Stack
 
+DEV - Use `uvicorn app.main:app --reload` to spin up backend
+
 We use `docker-compose` to spin up the Backend, Database, Redis, and Neo4j simultaneously.
 
 ```bash
