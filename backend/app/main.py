@@ -5,6 +5,8 @@ import asyncpg
 from neo4j import GraphDatabase
 import redis.asyncio as redis
 
+from app.tasks import run_review
+
 # --- Configuration (Load from Env) ---
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://aesop:aesop_pass@postgres:5432/aesop_db")
 NEO4J_URI = os.getenv("NEO4J_URI", "bolt://neo4j:7687")
@@ -51,3 +53,8 @@ app = FastAPI(title="Aesop Agentic API", lifespan=lifespan)
 @app.get("/health")
 async def health_check():
     return {"status": "operational", "system": "Aesop MVP"}
+
+@app.post("/review")
+def review(query: str):
+    result = run_review(query)
+    return result.dict()
