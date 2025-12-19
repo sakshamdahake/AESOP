@@ -1,5 +1,7 @@
-from typing import List, Dict, Optional
+from typing import List, Optional
 from pydantic import BaseModel, Field
+
+from app.agents.critic.schemas import PaperGrade
 
 
 class Paper(BaseModel):
@@ -19,7 +21,8 @@ class AgentState(BaseModel):
     retrieved_papers: List[Paper] = Field(default_factory=list)
 
     # Critic output
-    grades: Dict[str, float] = Field(default_factory=dict)
+    grades: List[PaperGrade] = Field(default_factory=list)
+    critic_decision: Optional[str] = None  # "sufficient" | "retrieve_more"
 
     # Synthesizer output
     synthesis_output: Optional[str] = None
