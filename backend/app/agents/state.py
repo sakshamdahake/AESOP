@@ -13,20 +13,38 @@ class Paper(BaseModel):
 
 
 class AgentState(BaseModel):
+    # =====================
     # User input
+    # =====================
     query: str
 
+    # =====================
     # Scout output
+    # =====================
     expanded_queries: List[str] = Field(default_factory=list)
     retrieved_papers: List[Paper] = Field(default_factory=list)
 
+    # =====================
     # Critic output
+    # =====================
     grades: List[PaperGrade] = Field(default_factory=list)
-    critic_decision: Optional[str] = None  # "sufficient" | "retrieve_more"
 
+    critic_decision: Optional[str] = None
+    # "sufficient" | "retrieve_more"
+
+    critic_explanation: Optional[str] = None
+    # Human-readable explanation of the decision
+
+    avg_quality: Optional[float] = None
+    discard_ratio: Optional[float] = None
+
+    # =====================
     # Synthesizer output
+    # =====================
     synthesis_output: Optional[str] = None
 
+    # =====================
     # Control
+    # =====================
     iteration_count: int = 0
     max_iterations: int = 3
