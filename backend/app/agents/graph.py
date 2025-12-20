@@ -3,6 +3,7 @@ from langgraph.graph import StateGraph, END
 from app.agents.state import AgentState
 from app.agents.scout.agent import scout_node
 from app.agents.critic.node import critic_node
+from app.agents.synthesizer.agent import synthesizer_node
 
 
 # ============================
@@ -15,6 +16,7 @@ def synthesizer_node(state: AgentState) -> AgentState:
     Will synthesize final answer from accepted evidence.
     """
     return state
+
 
 
 # ============================
