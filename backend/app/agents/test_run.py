@@ -1,16 +1,54 @@
-import asyncio
-
 from langchain_openai import ChatOpenAI
 
 from app.agents.critic.agent import CriticAgent
-from app.agents.critic.schemas import PaperGrade
 
-# Mega-LLM configs (MATCH Scout & Critic node)
+# ============================
+# Mega-LLM configuration
+# ============================
+
 BASE_URL = "https://ai.megallm.io/v1"
 AGENT_MODEL = "openai-gpt-oss-120b"
 
 
-async def main():
+# ============================
+# Mock retrieval batches
+# ============================
+
+def retrieve_batch(iteration: int) -> list[str]:
+    """
+    Simulates improving retrieval quality across CRAG iterations.
+    """
+
+    if iteration == 0:
+        return [
+            """
+            This case series reports outcomes in 10 patients with type 2 diabetes
+            treated with metformin. No control group was included.
+            """
+        ]
+
+    if iteration == 1:
+        return [
+            """
+            This observational cohort study followed 180 patients with type 2 diabetes
+            treated with metformin for 2 years and compared mortality outcomes.
+            """
+        ]
+
+    return [
+        """
+        This randomized controlled trial enrolled 1,200 patients with type 2 diabetes
+        and followed them for 5 years. Metformin treatment resulted in a statistically
+        significant reduction in all-cause mortality.
+        """
+    ]
+
+
+# ============================
+# CRAG loop test (SYNC)
+# ============================
+
+def main():
     llm = ChatOpenAI(
         model=AGENT_MODEL,
         base_url=BASE_URL,
@@ -23,33 +61,38 @@ async def main():
         "Does metformin reduce all-cause mortality in patients with type 2 diabetes?"
     )
 
-    # Minimal test abstracts (mocked but realistic)
-    abstracts = [
-        """
-        This randomized controlled trial enrolled 1,200 patients with type 2 diabetes
-        and followed them for 5 years. Patients treated with metformin showed a
-        statistically significant reduction in all-cause mortality compared to
-        standard therapy.
-        """,
-        """
-        This case study reports outcomes in 12 patients with type 2 diabetes treated
-        with metformin. Observational findings suggest possible benefit, but no
-        control group was included.
-        """,
-    ]
+    max_iterations = 3
+    iteration = 0
 
-    result = await critic.grade_batch(
-        research_question=research_question,
-        abstracts=abstracts,
-    )
+    print("\n=== CRAG LOOP TEST (SYNC CRITIC) ===")
 
-    print("\n=== CRITIC AGENT TEST ===")
-    print("Decision:", result["decision"])
-    print("\nGrades:")
-    for i, grade in enumerate(result["grades"], start=1):
-        print(f"\nPaper {i}:")
-        print(grade.model_dump())
+    while iteration < max_iterations:
+        print(f"\n--- Iteration {iteration + 1} ---")
+
+        abstracts = retrieve_batch(iteration)
+
+        result = critic.grade_batch(
+            research_question=research_question,
+            abstracts=abstracts,
+            iteration=iteration,
+        )
+
+        print("Decision:", result["decision"])
+
+        for i, grade in enumerate(result["grades"], start=1):
+            print(f"\nPaper {i}:")
+            print(grade.model_dump())
+
+        if result["decision"] == "sufficient":
+            print("\n✅ Evidence sufficient — stopping CRAG loop.")
+            break
+
+        print("\n🔄 Evidence insufficient — retrieving more...")
+        iteration += 1
+
+    else:
+        print("\n⚠️ Max iterations reached without sufficient evidence.")
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
