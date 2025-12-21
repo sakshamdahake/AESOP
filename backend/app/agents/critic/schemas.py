@@ -14,6 +14,9 @@ class PaperGrade(BaseModel):
     Structured evaluation of a single paper abstract.
     """
 
+    # pmid is injected by Python, never trusted from LLM
+    pmid: Optional[str] = None
+
     relevance_score: float = Field(
         ..., ge=0.0, le=1.0, description="Topical relevance to the research question"
     )

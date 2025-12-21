@@ -4,14 +4,32 @@ from app.agents.state import Paper
 from app.agents.synthesizer.schemas import GradedPaper
 
 
+from app.agents.critic.schemas import PaperGrade
+
+
 def build_graded_papers(
     papers: List[Paper],
-    grades: dict[str, float],
+    grades: List[PaperGrade],
 ) -> List[GradedPaper]:
     graded = []
 
+    grade_map: dict[str, float] = {}
+
+    for g in grades:
+        score = (
+            (g.relevance_score + g.methodology_score) / 2
+        )
+
+        if g.recommendation == "discard":
+            continue
+
+        if not g.sample_size_adequate:
+            score *= 0.7
+
+        grade_map[g.pmid] = score
+
     for paper in papers:
-        score = grades.get(paper.pmid)
+        score = grade_map.get(paper.pmid)
         if score is None:
             continue
 
@@ -25,6 +43,7 @@ def build_graded_papers(
         )
 
     return graded
+
 
 
 def format_papers_for_prompt(graded_papers: List[GradedPaper]) -> str:

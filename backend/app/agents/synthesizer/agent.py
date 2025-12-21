@@ -1,5 +1,6 @@
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import PromptTemplate
+from langchain_aws import ChatBedrock
 
 from app.agents.state import AgentState
 from app.agents.synthesizer.prompts import SYNTHESIS_PROMPT
@@ -8,10 +9,9 @@ from app.agents.synthesizer.utils import (
     format_papers_for_prompt,
 )
 
-
-llm = ChatOpenAI(
-    model="gpt-4o-mini",
-    temperature=0.1,
+llm = ChatBedrock(
+    model="amazon.nova-pro-v1:0",
+    region_name="us-east-1",
 )
 
 
