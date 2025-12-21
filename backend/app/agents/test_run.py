@@ -6,8 +6,15 @@ from app.agents.critic.agent import CriticAgent
 # Mega-LLM configuration
 # ============================
 
-BASE_URL = "https://ai.megallm.io/v1"
-AGENT_MODEL = "openai-gpt-oss-120b"
+# BASE_URL = "https://ai.megallm.io/v1"
+# AGENT_MODEL = "openai-gpt-oss-120b"
+
+# ============================
+# AWS Bedrock configuration
+# ============================
+
+base_url="https://bedrock-runtime.us-west-2.amazonaws.com/openai/v1", 
+api_key="$AWS_BEARER_TOKEN_BEDROCK"
 
 
 # ============================
@@ -50,9 +57,8 @@ def retrieve_batch(iteration: int) -> list[str]:
 
 def main():
     llm = ChatOpenAI(
-        model=AGENT_MODEL,
-        base_url=BASE_URL,
-        temperature=0.2,
+        base_url="https://bedrock-runtime.us-west-2.amazonaws.com/openai/v1", 
+        api_key="$AWS_BEARER_TOKEN_BEDROCK"
     )
 
     critic = CriticAgent(llm)

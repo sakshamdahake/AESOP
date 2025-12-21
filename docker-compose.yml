@@ -6,6 +6,8 @@ services:
       dockerfile: Dockerfile
       target: dev  # Use 'dev' stage for hot-reloading
     container_name: aesop_backend
+    env_file:
+      - .env  # Load development environment variables
     ports:
       - "8000:8000"
     volumes:

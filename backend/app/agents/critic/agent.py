@@ -1,7 +1,10 @@
 from typing import List, Dict, Any
 from collections import Counter, defaultdict
+import json
 
 from pydantic import ValidationError
+
+from app.logging import logger  # ✅ ADD
 
 from .schemas import PaperGrade, Recommendation
 from .rubric import (
@@ -15,7 +18,33 @@ from .prompts import SYSTEM_PROMPT, USER_PROMPT_TEMPLATE
 
 
 # -------------------------------------------------
-# Lightweight in-memory learning store (sync-safe)
+# STRICT JSON PARSING
+# -------------------------------------------------
+
+def parse_strict_json(text: str) -> dict:
+    text = text.strip()
+
+    if not (text.startswith("{") and text.endswith("}")):
+        raise ValueError("LLM output violated JSON-only contract")
+
+    return json.loads(text)
+
+
+# -------------------------------------------------
+# HARD NUMERIC NORMALIZATION
+# -------------------------------------------------
+
+def clamp_score(value: Any) -> float:
+    try:
+        value = float(value)
+    except Exception:
+        return 0.0
+
+    return max(0.0, min(1.0, value))
+
+
+# -------------------------------------------------
+# Lightweight in-memory learning store
 # -------------------------------------------------
 
 ACCEPTANCE_MEMORY = defaultdict(list)
@@ -23,16 +52,10 @@ ACCEPTANCE_MEMORY = defaultdict(list)
 
 class CriticAgent:
     """
-    CR์AG-enabled Critic Agent (SYNCHRONOUS VERSION).
-
-    This version is intentionally sync to match the
-    current Scout + Synthesizer agents and reduce complexity.
+    CRAG-enabled Critic Agent (SYNC).
     """
 
     def __init__(self, llm_client):
-        """
-        llm_client must support `invoke(messages)`
-        """
         self.llm = llm_client
 
     # -----------------------------
@@ -58,15 +81,25 @@ class CriticAgent:
         response = self.llm.invoke(messages)
 
         try:
-            grade = PaperGrade.model_validate_json(response.content)
-        except ValidationError as e:
+            parsed = parse_strict_json(response.content)
+
+            parsed["relevance_score"] = clamp_score(
+                parsed.get("relevance_score", 0.0)
+            )
+            parsed["methodology_score"] = clamp_score(
+                parsed.get("methodology_score", 0.0)
+            )
+
+            grade = PaperGrade.model_validate(parsed)
+
+        except (ValidationError, ValueError, json.JSONDecodeError) as e:
             raise RuntimeError(
-                f"CriticAgent schema validation failed: {e}"
+                "CriticAgent failed strict JSON or schema validation.\n"
+                f"Error: {e}\n"
+                f"Raw output:\n{response.content}"
             ) from e
 
-        # -----------------------------
-        # Apply study-type prior (EBM)
-        # -----------------------------
+        # Apply study-type prior
         if grade.study_type:
             prior = STUDY_TYPE_PRIORS.get(
                 grade.study_type.lower(), 0.20
@@ -79,7 +112,7 @@ class CriticAgent:
         return grade
 
     # -----------------------------
-    # Batch grading (CRAG step)
+    # Batch grading
     # -----------------------------
 
     def grade_batch(
@@ -88,22 +121,19 @@ class CriticAgent:
         abstracts: List[str],
         iteration: int = 0,
     ) -> Dict[str, Any]:
+
         grades: List[PaperGrade] = []
 
         for abstract in abstracts:
-            grade = self.grade_abstract(
-                research_question, abstract
+            grades.append(
+                self.grade_abstract(research_question, abstract)
             )
-            grades.append(grade)
 
         decision = self._make_global_decision(
             grades=grades,
             iteration=iteration,
         )
 
-        # -----------------------------
-        # Learning from acceptances
-        # -----------------------------
         if decision == "sufficient":
             self._record_acceptance(grades, iteration)
 
@@ -121,44 +151,90 @@ class CriticAgent:
         grades: List[PaperGrade],
         iteration: int,
     ) -> str:
+
         if not grades:
+            logger.info(
+                "CRITIC_DECISION_EMPTY",
+                extra={"iteration": iteration},
+            )
             return "retrieve_more"
 
-        # Disagreement-aware CRAG
         counts = Counter(g.recommendation for g in grades)
         total = len(grades)
 
         keep_ratio = counts[Recommendation.KEEP] / total
         discard_ratio = counts[Recommendation.DISCARD] / total
-
-        if keep_ratio >= 0.60:
-            return "sufficient"
-
-        if discard_ratio >= 0.50:
-            return "retrieve_more"
-
-        # Confidence decay
-        effective_threshold = max(
-            MIN_CONFIDENCE_FLOOR,
-            MIN_AVG_QUALITY_FOR_SUFFICIENT
-            - (iteration * CONFIDENCE_DECAY_RATE),
-        )
+        needs_more_ratio = counts[Recommendation.NEEDS_MORE] / total
 
         avg_quality = sum(
             (g.relevance_score + g.methodology_score) / 2
             for g in grades
         ) / total
 
+        effective_threshold = max(
+            MIN_CONFIDENCE_FLOOR,
+            MIN_AVG_QUALITY_FOR_SUFFICIENT
+            - (iteration * CONFIDENCE_DECAY_RATE),
+        )
+
+        # -----------------------------
+        # 🔍 METRICS LOGGING (KEY PART)
+        # -----------------------------
+
+        logger.info(
+            "CRITIC_CRAG_METRICS",
+            extra={
+                "iteration": iteration,
+                "num_papers": total,
+                "keep_ratio": round(keep_ratio, 3),
+                "discard_ratio": round(discard_ratio, 3),
+                "needs_more_ratio": round(needs_more_ratio, 3),
+                "avg_quality": round(avg_quality, 3),
+                "effective_threshold": round(effective_threshold, 3),
+                "counts": {
+                    "keep": counts[Recommendation.KEEP],
+                    "discard": counts[Recommendation.DISCARD],
+                    "needs_more": counts[Recommendation.NEEDS_MORE],
+                },
+            },
+        )
+
+        # -----------------------------
+        # Decision rules
+        # -----------------------------
+
+        if keep_ratio >= 0.40:
+            logger.info(
+                "CRITIC_DECISION_SUFFICIENT",
+                extra={"reason": "keep_ratio"},
+            )
+            return "sufficient"
+
+        if discard_ratio >= 0.40:
+            logger.info(
+                "CRITIC_DECISION_RETRIEVE_MORE",
+                extra={"reason": "discard_ratio"},
+            )
+            return "retrieve_more"
+
         if (
             avg_quality >= effective_threshold
             and discard_ratio <= MAX_DISCARD_RATIO
         ):
+            logger.info(
+                "CRITIC_DECISION_SUFFICIENT",
+                extra={"reason": "avg_quality"},
+            )
             return "sufficient"
 
+        logger.info(
+            "CRITIC_DECISION_RETRIEVE_MORE",
+            extra={"reason": "default"},
+        )
         return "retrieve_more"
 
     # -----------------------------
-    # Learning store (local)
+    # Learning store
     # -----------------------------
 
     def _record_acceptance(
