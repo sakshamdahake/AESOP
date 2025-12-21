@@ -47,4 +47,4 @@ class AgentState(BaseModel):
     # Control
     # =====================
     iteration_count: int = 0
-    max_iterations: int = 3
+    max_iterations: int = 1

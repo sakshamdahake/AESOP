@@ -57,4 +57,4 @@ async def health_check():
 @app.post("/review")
 def review(query: str):
     result = run_review(query)
-    return result.dict()
+    return result
