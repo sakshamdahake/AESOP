@@ -1,289 +1,294 @@
-# 🧠 Critic Agent — CRAG-Based Scientific Evidence Evaluator
 
-## Overview
+# Critic Agent — CRAG + pgvector Memory
 
-The **Critic Agent** is a core component of the **Aesop** system, responsible for **evaluating the quality of retrieved scientific literature** and deciding whether the current evidence is **sufficient** or whether **additional retrieval is required**.
+This folder contains the **Critic agent** of the AESOP system — a **CRAG-based (Corrective Retrieval-Augmented Generation) agent** designed for **biomedical evidence evaluation** with **persistent vector memory** using **PostgreSQL + pgvector**.
 
-This agent implements a **Corrective Retrieval-Augmented Generation (CRAG)** pattern tailored for **medical and scientific systematic reviews**, where *rigor, conservatism, and transparency* are critical.
+The Critic is the **decision-making authority** in the multi-agent system.  
+It evaluates retrieved scientific papers, determines whether the evidence is sufficient, and controls whether the system should **retrieve more evidence or converge**.
 
-The Critic Agent is **not a summarizer**.
-It acts as a **methodological reviewer**, similar to a human expert conducting a systematic review.
-
----
-
-## Why a Critic Agent Is Necessary
-
-In scientific domains (especially medicine):
-
-* Not all papers are equal
-* Abstracts are often incomplete
-* High-quality study design matters more than keywords
-* Evidence must converge before synthesis
-
-A naive RAG system will:
-
-* hallucinate certainty
-* over-trust weak evidence
-* fail silently
-
-The Critic Agent prevents this by **grading**, **rejecting**, and **forcing re-retrieval** until evidence quality is acceptable.
+This document explains **what was built**, **why it was built this way**, and **how it works in detail**.
 
 ---
 
-## Theoretical Foundation
+## 1. High-Level Role of the Critic Agent
 
-### 1. Corrective RAG (CRAG)
+The Critic agent acts as a **senior biomedical reviewer** in the agentic pipeline.
 
-CRAG introduces a feedback loop:
+It is responsible for:
 
-```
-Retrieve → Evaluate → Decide
-           ↑           ↓
-        Re-retrieve if insufficient
-```
+- Evaluating **scientific abstracts** for:
+  - Relevance to the research question
+  - Methodological rigor
+- Applying **CRAG logic** to decide:
+  - `"sufficient"` → stop retrieval and synthesize
+  - `"retrieve_more"` → request more evidence
+- Persisting **high-confidence evidence** into a **long-term vector memory**
+- Using **past accepted evidence** as a *bounded prior* in future decisions
 
-The Critic Agent is the **decision-maker** in this loop.
-
----
-
-### 2. Evidence-Based Medicine (EBM)
-
-The Critic Agent encodes core EBM principles:
-
-* Study design hierarchy (GRADE)
-* Sample size adequacy
-* Methodological transparency
-* Conservative decision-making
-
-This prevents the system from being fooled by:
-
-* buzzwords
-* underpowered studies
-* anecdotal evidence
+The Critic **never retrieves papers** and **never generates answers**.  
+It only **judges evidence and controls flow**.
 
 ---
 
-### 3. Reviewer Psychology (Human-Inspired)
+## 2. Why CRAG (Corrective RAG) Is Used
 
-Real reviewers:
+Traditional RAG systems retrieve documents once and generate an answer immediately.  
+This is **unsafe for biomedical domains**, where evidence quality varies widely.
 
-* Start strict
-* Relax slightly if evidence converges
-* Look for consensus
-* Learn from prior acceptances
+CRAG introduces **explicit correction loops**:
 
-These behaviors are explicitly modeled.
+1. Retrieve evidence
+2. Critically evaluate evidence
+3. Decide whether evidence is sufficient
+4. If not sufficient → retrieve more
+5. Repeat until convergence or stopping condition
 
----
+In AESOP:
 
-## High-Level Decision Criteria
+- The **Critic** implements CRAG logic
+- The **Scout** retrieves evidence
+- The **Synthesizer** generates the final answer
 
-For each retrieved abstract, the Critic Agent produces a structured evaluation:
-
-| Field                  | Meaning                                          |
-| ---------------------- | ------------------------------------------------ |
-| `relevance_score`      | How well the paper matches the research question |
-| `methodology_score`    | Rigor of study design and reporting              |
-| `sample_size_adequate` | Whether the study is statistically plausible     |
-| `study_type`           | RCT, cohort, case series, etc.                   |
-| `recommendation`       | `keep`, `discard`, or `needs_more`               |
-
-The **global decision** is either:
-
-* `sufficient`
-* `retrieve_more`
+This separation prevents hallucination and enforces **evidence-driven reasoning**.
 
 ---
 
-## Scientific Enhancements Implemented
+## 3. Critic Agent Architecture
 
-### 1️⃣ Evidence-Based Study Priors
+### Files in This Folder
 
-Different study designs have different *baseline credibility*.
-
-Example:
-
-* RCTs should never score as poorly as case series
-* Meta-analyses should start strong
-
-**Implementation:**
-
-```python
-STUDY_TYPE_PRIORS = {
-    "randomized controlled trial": 0.65,
-    "cohort study": 0.45,
-    "case series": 0.20,
-}
-```
-
-The Critic applies:
-
-```python
-methodology_score = max(llm_score, prior)
-```
+| File | Purpose |
+|---|---|
+| `agent.py` | Main Critic agent logic (grading, CRAG decision, memory writes) |
+| `node.py` | LangGraph node wrapper (state-safe execution) |
+| `memory.py` | pgvector-backed long-term memory |
+| `schemas.py` | Strict Pydantic schemas for LLM outputs |
+| `rubric.py` | Evidence thresholds and CRAG parameters |
+| `prompts.py` | Strict biomedical evaluation prompts |
 
 ---
 
-### 2️⃣ Reviewer Confidence Decay
+## 4. Evidence Grading (LLM + Guardrails)
 
-The agent relaxes strictness slightly over iterations.
+### What the Critic Grades
 
-| Iteration | Required Avg Quality |
-| --------- | -------------------- |
-| 0         | 0.70                 |
-| 1         | 0.65                 |
-| 2         | 0.60                 |
-| 3         | 0.55                 |
+The Critic grades **abstracts only**, not full papers.
 
-This models realistic reviewer behavior without sacrificing rigor.
+For each paper it assigns:
 
----
+- `relevance_score` ∈ [0,1]
+- `methodology_score` ∈ [0,1]
+- `study_type` (RCT, cohort, review, etc.)
+- `recommendation`:
+  - `KEEP`
+  - `NEEDS_MORE`
+  - `DISCARD`
 
-### 3️⃣ Disagreement-Aware CRAG
+### Why Strict JSON Enforcement Is Used
 
-Instead of averaging blindly, the agent checks **consensus**.
+Biomedical LLM outputs **must be machine-verifiable**.
 
-Rules:
+The Critic enforces:
 
-* ≥60% `KEEP` → sufficient
-* ≥50% `DISCARD` → retrieve more
-* Mixed signals → retrieve more
+- JSON-only output
+- No reasoning text
+- Pydantic validation
+- Score clamping
+- Never trusting identifiers from the LLM
+
+If any rule is violated → the grading fails loudly.
 
 This prevents:
-
-* One weak paper vetoing strong evidence
-* One strong paper overriding poor consensus
-
----
-
-### 4️⃣ Learning From Past Acceptances
-
-The Critic Agent maintains a lightweight **acceptance memory**:
-
-* Which study types were accepted
-* At what quality
-* At which iteration
-
-This allows future decisions to converge faster.
-
-> ⚠️ Currently in-memory only (MVP).
-> Designed to be persisted later.
+- Prompt leakage
+- Hallucinated metadata
+- Silent corruption
 
 ---
 
-## Code Structure
+## 5. CRAG Global Decision Logic
 
-```
-backend/app/agents/critic/
-├── agent.py      # Core CRAG logic
-├── rubric.py     # Scientific thresholds & priors
-├── schemas.py    # Pydantic output contracts
-├── prompts.py    # LLM instructions
-├── learning.py   # Lightweight learning memory
-└── README.md     # This document
-```
+After grading all papers, the Critic computes **aggregate metrics**:
 
----
+- Keep ratio
+- Discard ratio
+- Needs-more ratio
+- Average quality score
 
-## How Theory Maps to Code
+It then applies CRAG rules:
 
-### `rubric.py`
+- If too many papers are weak → `retrieve_more`
+- If quality is high enough → `sufficient`
+- If uncertainty remains → `retrieve_more`
 
-Defines:
-
-* Study-type priors
-* Thresholds
-* Confidence decay parameters
-
-This file contains **no LLM logic** — only science and policy.
+CRAG thresholds **decay slightly across iterations**, allowing convergence without premature acceptance.
 
 ---
 
-### `agent.py`
+## 6. Why We Added Long-Term Memory
 
-Key responsibilities:
+Without memory, CRAG systems are **stateless**:
+- The same query must re-discover the same evidence
+- Convergence cost repeats
+- No learning across runs
 
-1. Call LLM (`ainvoke`)
-2. Enforce strict JSON schema
-3. Apply scientific priors
-4. Aggregate grades
-5. Decide CRAG action
-6. Learn from acceptances
+To solve this, we introduced **persistent Critic memory**.
 
-The Critic Agent is **async-safe** and **LangGraph-compatible**.
+### Key Design Principle
 
----
+> **Memory influences thresholds, never decisions.**
 
-### `learning.py`
-
-Stores acceptance history:
-
-```python
-ACCEPTANCE_MEMORY[study_type] → [{quality, iteration}]
-```
-
-Used to adapt behavior over time.
+Memory is used as a **prior**, not a shortcut.
 
 ---
 
-## Running the Critic Agent (Standalone)
+## 7. pgvector-Backed Memory Design
 
-Inside the Docker container:
+### Storage Technology
 
-```bash
-python -m app.agents.test_run
-```
+- PostgreSQL 16
+- pgvector extension
+- Amazon Titan embeddings (1536-dimensional)
 
-This runs:
+### What Is Stored
 
-* isolated Critic evaluation
-* CRAG loop simulation
-* no LangGraph
-* no PubMed dependency
+Only **high-confidence accepted evidence** is stored:
 
----
+- Research query
+- Query embedding
+- Paper identifiers
+- Quality scores
+- Timestamp
 
-## What “Correct Behavior” Looks Like
+`DISCARD` papers are never stored.  
+`NEEDS_MORE` papers are intentionally excluded from acceptance memory.
 
-✔ Weak studies are rejected
-✔ Borderline studies trigger re-retrieval
-✔ Strong evidence converges
-✔ RCTs are not unfairly penalized
-✔ Case series do not dominate decisions
-
-If the system **refuses to accept evidence too easily**, that is a *feature*, not a bug.
+This prevents memory poisoning.
 
 ---
 
-## Future Extensions
+## 8. Memory Schema (Conceptual)
 
-Planned enhancements:
+```sql
+critic_acceptance_memory
+├── research_query
+├── query_hash           -- exact-match fast path
+├── query_embedding      -- vector(1536)
+├── pmid
+├── study_type
+├── quality_score
+├── iteration
+├── accepted_at
+````
 
-* Persist learning to Postgres
-* Visualization of CRAG convergence
-* Reviewer drift detection
-* Multi-reviewer ensembles
-* Citation anchoring
+### Indexes
+
+* `query_hash` → fast exact match
+* `ivfflat` cosine index → scalable vector search
 
 ---
 
-## Design Philosophy
+## 9. How Memory Is Queried
 
-> *In medicine, uncertainty should trigger more evidence — not confidence.*
+When a new query arrives:
 
-The Critic Agent enforces this principle throughout the system.
+1. **Exact-match fast path**
+
+   * If the same query was seen before → reuse memory rows
+2. **Vector similarity fallback**
+
+   * Cosine similarity ≥ 0.75
+   * Top-K capped results
+
+A **Memory Confidence Score (MCS)** is computed using:
+
+* Similarity
+* Quality
+* Time decay
+
+This score is **hard-capped (≤ 0.15)**.
 
 ---
 
-## Summary
+## 10. How Memory Influences CRAG (Safely)
 
-The Critic Agent is:
+Memory **does NOT**:
 
-* Conservative by design
-* Scientifically grounded
-* Self-correcting
-* Self-improving
-* Production-ready
+* Change paper grades
+* Force `"sufficient"`
+* Skip evaluation
+* Reuse old papers
 
-It transforms a simple RAG pipeline into a **trustworthy autonomous reviewer**.
+Memory **only**:
+
+* Slightly lowers the effective quality threshold
+
+This means:
+
+* Strong past evidence → faster convergence
+* Weak or unrelated queries → no effect
+
+Medical safety is preserved.
+
+---
+
+## 11. Why Many Bugs Were Encountered (And Why That’s Good)
+
+During development, several real-world issues surfaced:
+
+* pgvector type casting (`vector` vs `numeric[]`)
+* Timezone-aware vs naive timestamps
+* Decimal vs float arithmetic
+* PubMed API strictness
+* Network failures inside Docker
+* Partial data corruption
+
+Each issue was **fixed explicitly**, resulting in:
+
+* Fully defensive Scout tools
+* Fault-tolerant retrieval
+* Safe memory math
+* Production-grade robustness
+
+These issues validate that the system was tested under **realistic conditions**, not idealized demos.
+
+---
+
+## 12. What This System Achieves
+
+This Critic agent implements:
+
+* True CRAG (not pseudo-RAG)
+* Evidence-based biomedical evaluation
+* Persistent learning across runs
+* Safe, bounded memory influence
+* Deterministic, inspectable behavior
+
+It is suitable for:
+
+* Biomedical research assistance
+* Literature review automation
+* Clinical decision support (non-diagnostic)
+* Agentic AI research portfolios
+
+---
+
+## 13. Key Takeaway
+
+This Critic agent is **not a text generator**.
+
+It is:
+
+> A **scientific reasoning controller** that decides *when enough evidence is enough* — and remembers that decision responsibly.
+
+---
+
+## 14. Next Extensions (Planned / Possible)
+
+* Exploratory memory for `NEEDS_MORE` papers
+* Memory aging / pruning policies
+* Scout query expansion using memory
+* Citation graph integration (Neo4j)
+* Formal evaluation benchmarks
+
+---
 
