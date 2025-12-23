@@ -4,7 +4,7 @@ import json
 
 from pydantic import ValidationError
 
-from app.logging import logger  # ✅ ADD
+from app.logging import logger
 
 from .schemas import PaperGrade, Recommendation
 from .rubric import (
@@ -17,35 +17,20 @@ from .rubric import (
 from .prompts import SYSTEM_PROMPT, USER_PROMPT_TEMPLATE
 
 
-# -------------------------------------------------
-# STRICT JSON PARSING
-# -------------------------------------------------
-
 def parse_strict_json(text: str) -> dict:
     text = text.strip()
-
     if not (text.startswith("{") and text.endswith("}")):
         raise ValueError("LLM output violated JSON-only contract")
-
     return json.loads(text)
 
-
-# -------------------------------------------------
-# HARD NUMERIC NORMALIZATION
-# -------------------------------------------------
 
 def clamp_score(value: Any) -> float:
     try:
         value = float(value)
     except Exception:
         return 0.0
-
     return max(0.0, min(1.0, value))
 
-
-# -------------------------------------------------
-# Lightweight in-memory learning store
-# -------------------------------------------------
 
 ACCEPTANCE_MEMORY = defaultdict(list)
 
@@ -83,6 +68,9 @@ class CriticAgent:
         try:
             parsed = parse_strict_json(response.content)
 
+            # 🔒 Never trust LLM with identifiers
+            parsed.pop("pmid", None)
+
             parsed["relevance_score"] = clamp_score(
                 parsed.get("relevance_score", 0.0)
             )
@@ -99,7 +87,6 @@ class CriticAgent:
                 f"Raw output:\n{response.content}"
             ) from e
 
-        # Apply study-type prior
         if grade.study_type:
             prior = STUDY_TYPE_PRIORS.get(
                 grade.study_type.lower(), 0.20
@@ -112,22 +99,28 @@ class CriticAgent:
         return grade
 
     # -----------------------------
-    # Batch grading
+    # Batch grading (papers, not abstracts)
     # -----------------------------
 
     def grade_batch(
         self,
         research_question: str,
-        abstracts: List[str],
+        papers: List[Any],
         iteration: int = 0,
     ) -> Dict[str, Any]:
 
         grades: List[PaperGrade] = []
 
-        for abstract in abstracts:
-            grades.append(
-                self.grade_abstract(research_question, abstract)
+        for paper in papers:
+            grade = self.grade_abstract(
+                research_question=research_question,
+                abstract=paper.abstract,
             )
+
+            # 🔒 Inject trusted pmid
+            grade.pmid = paper.pmid
+
+            grades.append(grade)
 
         decision = self._make_global_decision(
             grades=grades,
@@ -153,10 +146,6 @@ class CriticAgent:
     ) -> str:
 
         if not grades:
-            logger.info(
-                "CRITIC_DECISION_EMPTY",
-                extra={"iteration": iteration},
-            )
             return "retrieve_more"
 
         counts = Counter(g.recommendation for g in grades)
@@ -177,10 +166,6 @@ class CriticAgent:
             - (iteration * CONFIDENCE_DECAY_RATE),
         )
 
-        # -----------------------------
-        # 🔍 METRICS LOGGING (KEY PART)
-        # -----------------------------
-
         logger.info(
             "CRITIC_CRAG_METRICS",
             extra={
@@ -191,46 +176,18 @@ class CriticAgent:
                 "needs_more_ratio": round(needs_more_ratio, 3),
                 "avg_quality": round(avg_quality, 3),
                 "effective_threshold": round(effective_threshold, 3),
-                "counts": {
-                    "keep": counts[Recommendation.KEEP],
-                    "discard": counts[Recommendation.DISCARD],
-                    "needs_more": counts[Recommendation.NEEDS_MORE],
-                },
             },
         )
 
-        # -----------------------------
-        # Decision rules
-        # -----------------------------
-
         if keep_ratio >= 0.40:
-            logger.info(
-                "CRITIC_DECISION_SUFFICIENT",
-                extra={"reason": "keep_ratio"},
-            )
             return "sufficient"
 
         if discard_ratio >= 0.40:
-            logger.info(
-                "CRITIC_DECISION_RETRIEVE_MORE",
-                extra={"reason": "discard_ratio"},
-            )
             return "retrieve_more"
 
-        if (
-            avg_quality >= effective_threshold
-            and discard_ratio <= MAX_DISCARD_RATIO
-        ):
-            logger.info(
-                "CRITIC_DECISION_SUFFICIENT",
-                extra={"reason": "avg_quality"},
-            )
+        if avg_quality >= effective_threshold and discard_ratio <= MAX_DISCARD_RATIO:
             return "sufficient"
 
-        logger.info(
-            "CRITIC_DECISION_RETRIEVE_MORE",
-            extra={"reason": "default"},
-        )
         return "retrieve_more"
 
     # -----------------------------

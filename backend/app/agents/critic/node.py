@@ -59,22 +59,12 @@ def critic_node(state: AgentState) -> AgentState:
 
                 return new_state
 
-            abstracts = [p.abstract for p in state.retrieved_papers]
-
-            logger.info(
-                "CRITIC_GRADING_START",
-                extra={
-                    "iteration": state.iteration_count,
-                    "num_abstracts": len(abstracts),
-                },
-            )
-
             # --------------------------------------------------
-            # CRAG grading (SYNC)
+            # CRAG grading (PASS PAPERS, NOT ABSTRACTS)
             # --------------------------------------------------
             result = critic.grade_batch(
                 research_question=state.query,
-                abstracts=abstracts,
+                papers=state.retrieved_papers,
                 iteration=state.iteration_count,
             )
 

@@ -7,19 +7,6 @@ from app.agents.synthesizer.agent import synthesizer_node
 
 
 # ============================
-# Synthesizer (Phase 2 stub)
-# ============================
-
-def synthesizer_node(state: AgentState) -> AgentState:
-    """
-    Phase 2:
-    Will synthesize final answer from accepted evidence.
-    """
-    return state
-
-
-
-# ============================
 # CRAG Routing Logic
 # ============================
 
@@ -27,7 +14,7 @@ def routing_logic(state: AgentState) -> str:
     """
     Decide next step based on Critic's global decision.
 
-    Explainable rules:
+    Rules:
     - If Critic says retrieve_more AND we have iterations left → scout
     - Otherwise → synthesize
     """
