@@ -1,10 +1,12 @@
 from typing import List, Dict, Any
-from collections import Counter, defaultdict
+from collections import Counter
 import json
 
 from pydantic import ValidationError
 
 from app.logging import logger
+from app.embeddings.bedrock import embed_query
+from app.agents.critic.memory import CriticMemoryStore
 
 from .schemas import PaperGrade, Recommendation
 from .rubric import (
@@ -16,6 +18,14 @@ from .rubric import (
 )
 from .prompts import SYSTEM_PROMPT, USER_PROMPT_TEMPLATE
 
+import psycopg2
+
+DATABASE_URL = "postgresql://aesop:aesop_pass@postgres:5432/aesop_db"
+
+
+# -----------------------------
+# Utilities
+# -----------------------------
 
 def parse_strict_json(text: str) -> dict:
     text = text.strip()
@@ -32,16 +42,18 @@ def clamp_score(value: Any) -> float:
     return max(0.0, min(1.0, value))
 
 
-ACCEPTANCE_MEMORY = defaultdict(list)
-
+# -----------------------------
+# Critic Agent
+# -----------------------------
 
 class CriticAgent:
     """
-    CRAG-enabled Critic Agent (SYNC).
+    CRAG-enabled Critic Agent (SYNC, memory-aware).
     """
 
     def __init__(self, llm_client):
         self.llm = llm_client
+        self.memory_store = CriticMemoryStore()
 
     # -----------------------------
     # Single abstract grading
@@ -87,6 +99,7 @@ class CriticAgent:
                 f"Raw output:\n{response.content}"
             ) from e
 
+        # Evidence hierarchy prior (soft boost, never override)
         if grade.study_type:
             prior = STUDY_TYPE_PRIORS.get(
                 grade.study_type.lower(), 0.20
@@ -99,7 +112,7 @@ class CriticAgent:
         return grade
 
     # -----------------------------
-    # Batch grading (papers, not abstracts)
+    # Batch grading
     # -----------------------------
 
     def grade_batch(
@@ -119,16 +132,20 @@ class CriticAgent:
 
             # 🔒 Inject trusted pmid
             grade.pmid = paper.pmid
-
             grades.append(grade)
 
         decision = self._make_global_decision(
+            research_question=research_question,
             grades=grades,
             iteration=iteration,
         )
 
         if decision == "sufficient":
-            self._record_acceptance(grades, iteration)
+            self._record_acceptance(
+                grades=grades,
+                iteration=iteration,
+                research_query=research_question,
+            )
 
         return {
             "grades": grades,
@@ -136,11 +153,12 @@ class CriticAgent:
         }
 
     # -----------------------------
-    # Global CRAG decision logic
+    # Global CRAG decision logic (MEMORY-AWARE)
     # -----------------------------
 
     def _make_global_decision(
         self,
+        research_question: str,
         grades: List[PaperGrade],
         iteration: int,
     ) -> str:
@@ -160,10 +178,16 @@ class CriticAgent:
             for g in grades
         ) / total
 
+        # 🔑 Memory bias (bounded, safe)
+        memory_boost = self.memory_store.fetch_memory_bias(
+            research_question
+        )
+
         effective_threshold = max(
             MIN_CONFIDENCE_FLOOR,
             MIN_AVG_QUALITY_FOR_SUFFICIENT
-            - (iteration * CONFIDENCE_DECAY_RATE),
+            - (iteration * CONFIDENCE_DECAY_RATE)
+            - memory_boost,
         )
 
         logger.info(
@@ -175,6 +199,7 @@ class CriticAgent:
                 "discard_ratio": round(discard_ratio, 3),
                 "needs_more_ratio": round(needs_more_ratio, 3),
                 "avg_quality": round(avg_quality, 3),
+                "memory_boost": round(memory_boost, 3),
                 "effective_threshold": round(effective_threshold, 3),
             },
         )
@@ -191,19 +216,49 @@ class CriticAgent:
         return "retrieve_more"
 
     # -----------------------------
-    # Learning store
+    # Persistent learning store
     # -----------------------------
 
     def _record_acceptance(
         self,
         grades: List[PaperGrade],
         iteration: int,
+        research_query: str,
     ) -> None:
+
+        embedding = embed_query(research_query)
+
+        conn = psycopg2.connect(DATABASE_URL)
+        cur = conn.cursor()
+
         for g in grades:
             if g.recommendation == Recommendation.KEEP:
-                ACCEPTANCE_MEMORY[g.study_type].append(
-                    {
-                        "quality": (g.relevance_score + g.methodology_score) / 2,
-                        "iteration": iteration,
-                    }
+                cur.execute(
+                    """
+                    INSERT INTO critic_acceptance_memory (
+                        research_query,
+                        query_embedding,
+                        pmid,
+                        study_type,
+                        relevance_score,
+                        methodology_score,
+                        quality_score,
+                        iteration
+                    )
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s)
+                    """,
+                    (
+                        research_query,
+                        embedding,
+                        g.pmid,
+                        g.study_type,
+                        g.relevance_score,
+                        g.methodology_score,
+                        (g.relevance_score + g.methodology_score) / 2,
+                        iteration,
+                    ),
                 )
+
+        conn.commit()
+        cur.close()
+        conn.close()
