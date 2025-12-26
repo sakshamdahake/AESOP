@@ -23,8 +23,9 @@ class PaperGrade(BaseModel):
     methodology_score: float = Field(
         ..., ge=0.0, le=1.0, description="Methodological rigor"
     )
+    # FIX: Make optional with default False (LLM sometimes returns null)
     sample_size_adequate: bool = Field(
-        ..., description="Whether sample size is adequate for the study type"
+        default=False, description="Whether sample size is adequate for the study type"
     )
     study_type: Optional[str] = Field(
         None, description="RCT, Cohort, Case-Control, Case Study, Review, etc."
