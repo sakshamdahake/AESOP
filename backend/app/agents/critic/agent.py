@@ -90,6 +90,9 @@ class CriticAgent:
                 parsed.get("methodology_score", 0.0)
             )
 
+            if parsed.get("sample_size_adequate") is None:
+                parsed["sample_size_adequate"] = False
+
             grade = PaperGrade.model_validate(parsed)
 
         except (ValidationError, ValueError, json.JSONDecodeError) as e:
