@@ -34,6 +34,8 @@ Unlike traditional RAG systems that retrieve once and generate, AESOP implements
 | Memory | Stateless | Persistent pgvector + Redis session cache |
 | Multi-turn | Not supported | Session-aware with intelligent routing |
 | Evidence Grading | None | GRADE-inspired methodology scoring |
+| Intent Understanding | None | Hybrid classifier (pattern + LLM) |
+| Conversation | Single query | Natural chat with context |
 
 ---
 
@@ -42,7 +44,9 @@ Unlike traditional RAG systems that retrieve once and generate, AESOP implements
 - **🔬 Biomedical Focus**: Specialized prompts and evaluation rubrics for scientific literature
 - **🔄 CRAG Loop**: Corrective retrieval until evidence quality threshold is met
 - **🧠 Persistent Memory**: pgvector-backed long-term memory influences future evaluations
-- **💬 Multi-Turn Sessions**: Intelligent routing for follow-up queries (3-route model)
+- **💬 Multi-Turn Sessions**: Intelligent routing for follow-up queries (4-route model)
+- **🎯 Intent Classification**: Hybrid pattern + LLM classifier for smart query understanding
+- **🗣️ Natural Chat**: Conversational interface with greetings, thanks, and system questions
 - **📊 Evidence Grading**: GRADE-inspired methodology and relevance scoring
 - **🏗️ LangGraph Architecture**: Robust state machine with conditional edges
 - **☁️ AWS Bedrock**: Claude Haiku, Nova Pro, and Titan embeddings
@@ -61,13 +65,24 @@ Unlike traditional RAG systems that retrieve once and generate, AESOP implements
 │                                                                              │
 │    ┌──────────────┐     ┌──────────────────────────────────────────────┐    │
 │    │   FastAPI    │     │           ORCHESTRATOR GRAPH                 │    │
-│    │   /review    │────▶│  ┌────────┐                                  │    │
-│    └──────────────┘     │  │ Router │──┬─▶ Route A: Full Graph         │    │
-│                         │  └────────┘  │   (Scout→Critic→Synthestic)   │    │
-│                         │              ├─▶ Route B: Augmented Context   │    │
-│                         │              │   (Scout→Merge→Synthesizer)   │    │
-│                         │              └─▶ Route C: Context Q&A         │    │
-│                         │                  (Direct LLM Answer)          │    │
+│    │   /chat      │────▶│                                              │    │
+│    │   /review    │     │  ┌────────┐                                  │    │
+│    └──────────────┘     │  │ Intent │──┬─▶ Chat (General conversation) │    │
+│                         │  └────────┘  ├─▶ Utility (Reformat output)   │    │
+│                         │              └─▶ Router (Research queries)   │    │
+│                         │                    │                         │    │
+│                         │              ┌─────┴─────┐                   │    │
+│                         │              ▼           ▼                   │    │
+│                         │         ┌────────┐  ┌────────┐               │    │
+│                         │         │ Route A│  │Route B │               │    │
+│                         │         │ (Full) │  │(Augment│               │    │
+│                         │         └────────┘  └────────┘               │    │
+│                         │              │           │                   │    │
+│                         │              ▼           ▼                   │    │
+│                         │         ┌────────────────────┐               │    │
+│                         │         │     Route C        │               │    │
+│                         │         │   (Context Q&A)    │               │    │
+│                         │         └────────────────────┘               │    │
 │                         └──────────────────────────────────────────────┘    │
 │                                           │                                  │
 │    ┌──────────────────────────────────────┼──────────────────────────────┐  │
@@ -82,69 +97,94 @@ Unlike traditional RAG systems that retrieve once and generate, AESOP implements
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### Agent Flow (Route A - Full Graph)
+### Complete Agent Flow
 
 ```
                     ┌─────────────────────────────────────────┐
-                    │              USER QUERY                  │
-                    │  "What are treatments for Type 2        │
-                    │   diabetes?"                            │
+                    │              USER MESSAGE                │
+                    │  "Hello!" / "What causes diabetes?" /   │
+                    │  "Compare these studies"                │
                     └─────────────────┬───────────────────────┘
                                       │
                                       ▼
                     ┌─────────────────────────────────────────┐
-                    │            ROUTER AGENT                  │
-                    │  • Checks Redis for session context     │
-                    │  • Analyzes query patterns              │
-                    │  • Routes to appropriate path           │
+                    │         INTENT CLASSIFIER                │
+                    │                                          │
+                    │  Stage 1: Fast-path (regex patterns)    │
+                    │  Stage 2: Keyword analysis              │
+                    │  Stage 3: LLM classification            │
+                    │  Stage 4: Context validation            │
                     └─────────────────┬───────────────────────┘
-                                      │ (New Session → Route A)
-                                      ▼
+                                      │
+            ┌─────────────────────────┼─────────────────────────┐
+            │                         │                         │
+            ▼                         ▼                         ▼
+    ┌───────────────┐        ┌───────────────┐        ┌───────────────┐
+    │     CHAT      │        │    UTILITY    │        │    ROUTER     │
+    │               │        │               │        │               │
+    │ • Greetings   │        │ • Shorten     │        │ • Analyze     │
+    │ • Thanks      │        │ • Bullets     │        │   query       │
+    │ • System Q&A  │        │ • Simplify    │        │ • Check       │
+    │ • Small talk  │        │ • Key points  │        │   session     │
+    └───────┬───────┘        └───────┬───────┘        └───────┬───────┘
+            │                         │                         │
+            │                         │           ┌─────────────┼─────────────┐
+            │                         │           │             │             │
+            │                         │           ▼             ▼             ▼
+            │                         │    ┌───────────┐ ┌───────────┐ ┌───────────┐
+            │                         │    │  ROUTE A  │ │  ROUTE B  │ │  ROUTE C  │
+            │                         │    │Full Graph │ │ Augmented │ │Context QA │
+            │                         │    │           │ │  Context  │ │           │
+            │                         │    │Scout→     │ │Scout→     │ │ Direct    │
+            │                         │    │Critic→    │ │Merge→     │ │ LLM with  │
+            │                         │    │Synthestic │ │Synthesizer│ │ cache     │
+            │                         │    └─────┬─────┘ └─────┬─────┘ └─────┬─────┘
+            │                         │          │             │             │
+            └─────────────────────────┴──────────┴─────────────┴─────────────┘
+                                                  │
+                                                  ▼
+                                    ┌─────────────────────────────┐
+                                    │        SAVE SESSION         │
+                                    │  • Update Redis cache       │
+                                    │  • Extend TTL               │
+                                    │  • Store embeddings         │
+                                    └─────────────────────────────┘
+                                                  │
+                                                  ▼
+                                    ┌─────────────────────────────┐
+                                    │          RESPONSE           │
+                                    └─────────────────────────────┘
+```
+
+### Intent Classification Flow (Hybrid Approach)
+
+```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                              CRAG LOOP                                       │
-│  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │                                                                      │    │
-│  │   ┌─────────────┐      ┌─────────────┐      ┌─────────────────┐    │    │
-│  │   │   SCOUT     │      │   CRITIC    │      │   Decision:     │    │    │
-│  │   │             │      │             │      │                 │    │    │
-│  │   │ • Expand    │─────▶│ • Grade     │─────▶│ sufficient?     │    │    │
-│  │   │   query     │      │   papers    │      │                 │    │    │
-│  │   │ • Search    │      │ • CRAG      │      │ YES → Synthesize│    │    │
-│  │   │   PubMed    │      │   decision  │      │ NO  → Loop back │    │    │
-│  │   │ • Fetch     │      │ • Memory    │      │                 │    │    │
-│  │   │   abstracts │      │   update    │      └────────┬────────┘    │    │
-│  │   └─────────────┘      └─────────────┘               │             │    │
-│  │         ▲                                            │             │    │
-│  │         └────────────── retrieve_more ───────────────┘             │    │
-│  │                                                                     │    │
-│  └─────────────────────────────────────────────────────────────────────┘    │
-│                                      │ sufficient                            │
-└──────────────────────────────────────┼──────────────────────────────────────┘
-                                       ▼
-                    ┌─────────────────────────────────────────┐
-                    │          SYNTHESIZER AGENT              │
-                    │  • Formats evidence by quality          │
-                    │  • Generates structured review          │
-                    │  • Cites PMIDs                          │
-                    └─────────────────┬───────────────────────┘
-                                      │
-                                      ▼
-                    ┌─────────────────────────────────────────┐
-                    │          SAVE SESSION                    │
-                    │  • Cache to Redis (60 min TTL)          │
-                    │  • Store query embedding                │
-                    │  • Enable follow-up queries             │
-                    └─────────────────┬───────────────────────┘
-                                      │
-                                      ▼
-                    ┌─────────────────────────────────────────┐
-                    │           STRUCTURED REVIEW             │
-                    │  1. Background                          │
-                    │  2. High-Quality Evidence Summary       │
-                    │  3. Lower-Quality Evidence              │
-                    │  4. Limitations                         │
-                    │  5. Conclusion                          │
-                    └─────────────────────────────────────────┘
+│                        HYBRID INTENT CLASSIFIER                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  STAGE 1: Fast-Path (Regex) ─────────────────────────────── ~50% of msgs    │
+│  ─────────────────────────────                                               │
+│  Patterns: hi, hello, thanks, bye, ok, yes, no, cool, great...              │
+│  Result: Instant "chat" classification (no LLM cost)                        │
+│                                                                              │
+│  STAGE 2: Keyword Analysis ──────────────────────────────── ~30% of msgs    │
+│  ─────────────────────────────                                               │
+│  • MEDICAL_KEYWORDS (100+ terms): diabetes, cancer, treatment...            │
+│  • SYSTEM_KEYWORDS: "who are you", "what can you do"...                     │
+│  • FOLLOWUP_KEYWORDS: "these studies", "compare them"...                    │
+│  • UTILITY_KEYWORDS: "make it shorter", "bullet points"...                  │
+│                                                                              │
+│  STAGE 3: LLM Classification ────────────────────────────── ~20% of msgs    │
+│  ─────────────────────────────                                               │
+│  Claude Haiku with detailed prompt for ambiguous cases                      │
+│                                                                              │
+│  STAGE 4: Context Validation                                                │
+│  ─────────────────────────────                                               │
+│  • followup_research without session → research                             │
+│  • utility without output → chat                                            │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
@@ -244,10 +284,20 @@ asyncio.run(init())
 # Health check
 curl http://localhost:8000/health
 
-# Run a literature review
-curl -X POST http://localhost:8000/review \
+# Chat (general conversation)
+curl -X POST http://localhost:8000/chat \
   -H "Content-Type: application/json" \
-  -d '{"query": "What are the treatments for Type 2 diabetes?"}'
+  -d '{"message": "Hello!"}'
+
+# Research query
+curl -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "What are the treatments for Type 2 diabetes?"}'
+
+# Follow-up query (use session_id from previous response)
+curl -X POST http://localhost:8000/chat \
+  -H "Content-Type: application/json" \
+  -d '{"message": "What sample sizes did these studies use?", "session_id": "<session_id>"}'
 ```
 
 ---
@@ -256,15 +306,15 @@ curl -X POST http://localhost:8000/review \
 
 ### Endpoints
 
-#### `POST /review`
+#### `POST /chat` (Recommended)
 
-Execute a literature review query with session support.
+Main endpoint with full intent classification support.
 
 **Request:**
 ```json
 {
-  "query": "What are the latest treatments for Type 2 diabetes?",
-  "session_id": null  // Optional: for follow-up queries
+  "message": "What are the latest treatments for Type 2 diabetes?",
+  "session_id": null
 }
 ```
 
@@ -274,44 +324,57 @@ Execute a literature review query with session support.
   "response": "## Background\n\nType 2 diabetes mellitus...",
   "session_id": "550e8400-e29b-41d4-a716-446655440000",
   "route_taken": "full_graph",
+  "intent": "research",
+  "intent_confidence": 0.92,
   "papers_count": 12,
   "critic_decision": "sufficient",
   "avg_quality": 0.72
 }
 ```
 
-#### `POST /review` (Follow-up)
+#### Intent-Based Responses
+
+| Message Type | Intent | Route | Response |
+|--------------|--------|-------|----------|
+| "Hello!" | `chat` | `chat` | Friendly greeting |
+| "What can you do?" | `chat` | `chat` | Capability explanation |
+| "What causes diabetes?" | `research` | `full_graph` | Literature review |
+| "What sample sizes?" (with session) | `followup_research` | `context_qa` | Answer from cached papers |
+| "Make it shorter" (with session) | `utility` | `utility` | Reformatted output |
+
+#### `POST /review` (Legacy)
+
+Backward-compatible endpoint.
 
 ```json
 {
-  "query": "What sample sizes did these studies use?",
-  "session_id": "550e8400-e29b-41d4-a716-446655440000"
+  "query": "What are the treatments for Type 2 diabetes?",
+  "session_id": null
 }
 ```
+
+#### `GET /session/{session_id}`
+
+Get session information.
 
 **Response:**
 ```json
 {
-  "response": "Based on the retrieved studies...",
   "session_id": "550e8400-e29b-41d4-a716-446655440000",
-  "route_taken": "context_qa",
+  "original_query": "What are treatments for diabetes?",
+  "turn_count": 3,
   "papers_count": 12,
-  "critic_decision": null,
-  "avg_quality": null
+  "papers": [
+    {"pmid": "12345678", "title": "Study on diabetes...", "quality_score": 0.85}
+  ],
+  "created_at": "2024-12-29T10:00:00Z",
+  "updated_at": "2024-12-29T10:15:00Z"
 }
 ```
 
 #### `DELETE /session/{session_id}`
 
 Manually invalidate a session.
-
-**Response:**
-```json
-{
-  "status": "deleted",
-  "session_id": "550e8400-e29b-41d4-a716-446655440000"
-}
-```
 
 #### `GET /health`
 
@@ -321,52 +384,135 @@ Health check endpoint.
 
 ## Agents
 
-### 1. Router Agent
+### 1. Intent Classifier Agent
 
-**Purpose:** Intelligent query classification for multi-turn conversations.
+**Purpose:** Classify user intent using hybrid pattern + LLM approach.
 
-**Model:** Claude 3 Haiku (fast, cost-effective)
+**Model:** Claude 3 Haiku (for LLM stage only)
+
+**Location:** `backend/app/agents/intent/`
+
+#### Classification Pipeline
+
+| Stage | Method | Coverage | Cost |
+|-------|--------|----------|------|
+| 1. Fast-path | Regex patterns | ~50% | Free |
+| 2. Keyword | Set matching | ~30% | Free |
+| 3. LLM | Claude Haiku | ~20% | ~$0.001 |
+| 4. Validation | Rule-based | 100% | Free |
+
+#### Intent Types
+
+| Intent | Description | Example |
+|--------|-------------|---------|
+| `chat` | General conversation | "Hello!", "What can you do?" |
+| `research` | Medical literature query | "What causes diabetes?" |
+| `followup_research` | Question about prior results | "Compare these studies" |
+| `utility` | Reformat existing output | "Make it shorter" |
+
+#### Keyword Sets
+
+```python
+MEDICAL_KEYWORDS = {
+    "diabetes", "cancer", "treatment", "drug", "symptom",
+    "disease", "therapy", "medication", "clinical", "trial",
+    # ... 100+ medical/scientific terms
+}
+
+SYSTEM_KEYWORDS = {
+    "who are you", "what can you do", "how does this work",
+    "are you a bot", "can i chat", "your name",
+    # ... system/meta questions
+}
+
+FOLLOWUP_KEYWORDS = {
+    "these studies", "those papers", "compare them",
+    "first study", "tell me more", "which one",
+    # ... reference indicators
+}
+
+UTILITY_KEYWORDS = {
+    "make it shorter", "bullet points", "simplify",
+    "key points only", "summarize it",
+    # ... reformatting requests
+}
+```
+
+---
+
+### 2. Chat Agent
+
+**Purpose:** Handle general conversation and system questions.
+
+**Model:** Claude 3 Haiku
+
+**Location:** `backend/app/agents/chat/`
+
+#### Features
+
+- **Canned Responses**: Instant replies for greetings, thanks, capability questions
+- **LLM Fallback**: Nuanced conversation for complex chat messages
+- **Personality**: Friendly, helpful AESOP persona
+
+#### Canned Response Examples
+
+| User Message | Bot Response |
+|--------------|--------------|
+| "Hello!" | "Hello! I'm AESOP, your biomedical literature review assistant..." |
+| "Thanks!" | "You're welcome! Let me know if you have any other research questions." |
+| "What can you do?" | "I'm AESOP, an AI-powered biomedical literature review assistant..." |
+| "Goodbye!" | "Goodbye! Feel free to come back anytime..." |
+
+---
+
+### 3. Utility Agent
+
+**Purpose:** Transform and reformat existing output.
+
+**Model:** Claude 3 Haiku
+
+**Location:** `backend/app/agents/utility/`
+
+#### Supported Transformations
+
+| Request | Action |
+|---------|--------|
+| "Make it shorter" | Condense to key points |
+| "Bullet points" | Convert to bulleted list |
+| "Simplify" | Use simpler language |
+| "Just the conclusion" | Extract conclusion only |
+| "Table format" | Organize as table |
+
+---
+
+### 4. Router Agent
+
+**Purpose:** Intelligent query classification for research queries.
+
+**Model:** Claude 3 Haiku (for ambiguous cases)
 
 **Location:** `backend/app/agents/router/`
 
-#### Routing Logic
+#### Multi-Signal Routing
 
-The Router uses a **multi-signal approach** to classify queries:
-
-| Signal | Description | Detection Method |
-|--------|-------------|------------------|
-| **Deictic Markers** | "these studies", "those results" | Regex patterns |
-| **Explicit References** | "first paper", "PMID 12345" | Regex patterns |
-| **Keyword Overlap** | Shared medical terms | Jaccard similarity |
-| **Query Type** | Clarification vs. new question | Pattern matching |
-| **Embedding Similarity** | Semantic relatedness | Cosine similarity (secondary) |
+| Signal | Description | Detection |
+|--------|-------------|-----------|
+| Deictic Markers | "these studies", "those results" | Regex |
+| Explicit References | "first paper", "PMID 12345" | Regex |
+| Keyword Overlap | Shared medical terms | Jaccard similarity |
+| Query Type | Clarification vs new question | Pattern matching |
 
 #### Routes
 
 | Route | Trigger | Execution | Cost |
 |-------|---------|-----------|------|
-| **Route A: Full Graph** | New topic, low similarity | Scout → Critic → Synthesizer | High |
-| **Route B: Augmented Context** | Related topic, needs new evidence | Scout → Merge → Synthesizer | Medium |
-| **Route C: Context Q&A** | Question about existing results | Direct LLM with cached papers | Low |
-
-#### Example Classifications
-
-```python
-# Route C (Context Q&A)
-"What sample sizes did these studies use?"  # Deictic "these studies"
-"Explain the methodology of paper 1"         # Explicit reference
-"Compare the RCTs in the results"            # Comparison of existing
-
-# Route B (Augmented Context)  
-"What about metformin side effects?"         # Related but new focus
-
-# Route A (Full Graph)
-"What causes Alzheimer's disease?"           # Completely new topic
-```
+| **Route A: Full Graph** | New topic | Scout → Critic → Synthesizer | High |
+| **Route B: Augmented** | Related topic, needs evidence | Scout → Merge → Synthesizer | Medium |
+| **Route C: Context Q&A** | Question about existing results | Direct LLM with cache | Low |
 
 ---
 
-### 2. Scout Agent
+### 5. Scout Agent
 
 **Purpose:** Query expansion and literature retrieval from PubMed.
 
@@ -377,127 +523,60 @@ The Router uses a **multi-signal approach** to classify queries:
 #### Workflow
 
 ```
-User Query
-    │
-    ▼
-┌─────────────────────────────────────┐
-│         QUERY EXPANSION              │
-│  LLM generates 3-5 PubMed queries   │
-│                                      │
-│  Input: "diabetes treatments"        │
-│  Output:                             │
-│    - "type 2 diabetes treatment"     │
-│    - "diabetes mellitus therapy"     │
-│    - "antidiabetic medications"      │
-└─────────────────┬───────────────────┘
-                  │
-                  ▼
-┌─────────────────────────────────────┐
-│         PUBMED SEARCH                │
-│  ESearch API for each query         │
-│  Returns PMIDs (max 10 per query)   │
-└─────────────────┬───────────────────┘
-                  │
-                  ▼
-┌─────────────────────────────────────┐
-│         PUBMED FETCH                 │
-│  EFetch API for abstracts           │
-│  Batched requests (3 PMIDs/batch)   │
-│  Fault-tolerant (partial results)   │
-└─────────────────┬───────────────────┘
-                  │
-                  ▼
-            List[Paper]
+User Query → Query Expansion (LLM) → PubMed Search → Fetch Abstracts → Papers
 ```
 
-#### Output Format
+#### Features
 
-```python
-class Paper(BaseModel):
-    pmid: str
-    title: str
-    abstract: str
-    publication_year: Optional[int]
-    journal: Optional[str]
-```
-
-#### Error Handling
-
-- Network failures return empty results (never crash)
-- Invalid PMIDs are skipped
-- Partial results are accepted
+- **Robust JSON Parsing**: Handles malformed LLM output gracefully
+- **Fallback Extraction**: Multiple strategies to extract queries
+- **Error Tolerance**: Partial results accepted, never crashes
 
 ---
 
-### 3. Critic Agent
+### 6. Critic Agent
 
 **Purpose:** Evidence evaluation and CRAG decision-making.
 
-**Model:** Amazon Nova Pro (better reasoning)
+**Model:** Amazon Nova Pro
 
 **Location:** `backend/app/agents/critic/`
 
 #### Grading Rubric
 
-Each paper is evaluated on:
-
 | Metric | Range | Description |
 |--------|-------|-------------|
-| `relevance_score` | 0.0 - 1.0 | Topical relevance to research question |
+| `relevance_score` | 0.0 - 1.0 | Topical relevance |
 | `methodology_score` | 0.0 - 1.0 | Methodological rigor |
-| `sample_size_adequate` | bool | Sufficient sample for study type |
-| `study_type` | string | RCT, Cohort, Case-Control, etc. |
+| `sample_size_adequate` | bool | Sufficient sample |
+| `study_type` | string | RCT, Cohort, etc. |
 | `recommendation` | enum | KEEP, DISCARD, NEEDS_MORE |
 
-#### Evidence Hierarchy Priors (GRADE-Inspired)
+#### GRADE-Inspired Study Priors
 
 ```python
 STUDY_TYPE_PRIORS = {
     "meta-analysis": 0.85,
     "systematic review": 0.80,
     "randomized controlled trial": 0.70,
-    "rct": 0.70,
     "cohort study": 0.55,
     "case-control study": 0.50,
-    "cross-sectional study": 0.45,
     "case series": 0.30,
-    "case study": 0.25,
     "expert opinion": 0.20,
 }
 ```
 
-#### CRAG Decision Logic
+#### Throttling Protection
 
-```python
-def _make_global_decision(grades, iteration, memory_boost):
-    # Compute aggregate metrics
-    keep_ratio = count(KEEP) / total
-    discard_ratio = count(DISCARD) / total
-    avg_quality = mean((relevance + methodology) / 2)
-    
-    # Apply memory-influenced threshold
-    effective_threshold = max(
-        MIN_CONFIDENCE_FLOOR,  # 0.45
-        MIN_AVG_QUALITY_FOR_SUFFICIENT  # 0.60
-        - (iteration * CONFIDENCE_DECAY_RATE)  # 0.07 per iteration
-        - memory_boost,  # 0.0 - 0.15
-    )
-    
-    # Decision rules
-    if keep_ratio >= 0.40:
-        return "sufficient"
-    if discard_ratio >= 0.40:
-        return "retrieve_more"
-    if avg_quality >= effective_threshold:
-        return "sufficient"
-    return "retrieve_more"
-```
+- **Retry with Backoff**: Exponential backoff on AWS throttling
+- **Inter-paper Delay**: 500ms between paper evaluations
+- **Max Retries**: 5 attempts before failure
 
 ---
 
-### 4. Synthesizer Agent
+### 7. Synthesizer Agent
 
-**Purpose:** Generate structured literature review from graded evidence.
+**Purpose:** Generate structured literature review.
 
 **Model:** Amazon Nova Pro
 
@@ -507,45 +586,26 @@ def _make_global_decision(grades, iteration, memory_boost):
 
 ```markdown
 ## 1. Background
-[Context and importance of the research question]
+[Context and importance]
 
 ## 2. Summary of High-Quality Evidence
-[Papers with quality score ≥ 0.7, cited by PMID]
+[Papers with quality ≥ 0.7]
 
-## 3. Summary of Lower-Quality or Conflicting Evidence
-[Papers with score < 0.7 or conflicting findings]
+## 3. Summary of Lower-Quality Evidence
+[Papers with quality < 0.7]
 
-## 4. Limitations of Current Evidence
-[Gaps, biases, methodological concerns]
+## 4. Limitations
+[Gaps, biases, concerns]
 
 ## 5. Conclusion
-[Evidence-based answer to the research question]
-```
-
-#### Paper Filtering
-
-```python
-def build_graded_papers(papers, grades):
-    for paper, grade in zip(papers, grades):
-        # Skip discarded papers
-        if grade.recommendation == "discard":
-            continue
-        
-        # Compute quality score
-        score = (relevance + methodology) / 2
-        
-        # Penalize inadequate sample size
-        if not grade.sample_size_adequate:
-            score *= 0.7
-        
-        yield GradedPaper(pmid, title, abstract, score)
+[Evidence-based answer]
 ```
 
 ---
 
-### 5. Context Q&A Agent
+### 8. Context Q&A Agent
 
-**Purpose:** Answer follow-up questions using cached papers (no retrieval).
+**Purpose:** Answer questions using cached papers.
 
 **Model:** Claude 3 Haiku
 
@@ -553,24 +613,9 @@ def build_graded_papers(papers, grades):
 
 #### When Used
 
-- Route C queries (high similarity or explicit references)
+- Route C queries (followup_research intent)
 - Questions about existing search results
-- Clarifications, comparisons, explanations
-
-#### Context Injection
-
-```python
-def get_papers_context(session_context, max_papers=10):
-    """Format cached papers for LLM context."""
-    for i, paper in enumerate(papers[:max_papers]):
-        yield f"""
-[Paper {i}]
-PMID: {paper.pmid}
-Title: {paper.title}
-Quality Score: {paper.quality_score}
-Abstract: {paper.abstract[:600]}...
-"""
-```
+- Comparisons, clarifications, explanations
 
 ---
 
@@ -584,7 +629,8 @@ AESOP implements a **two-layer memory architecture**:
 
 **TTL:** 60 minutes
 
-**Storage:**
+**Key Format:** `aesop:session:{session_id}`
+
 ```python
 class SessionContext(BaseModel):
     session_id: str
@@ -597,145 +643,49 @@ class SessionContext(BaseModel):
     updated_at: datetime
 ```
 
-**Key Format:** `aesop:session:{session_id}`
-
 **Usage:**
-- Router fetches session to determine query relatedness
-- Context Q&A uses cached papers for direct answers
-- Augmented Context merges cached + new papers
+- Intent classifier checks for existing session
+- Router uses session for similarity comparison
+- Context Q&A uses cached papers
+- Utility transforms cached synthesis
 
 ---
 
 ### Layer 2: Long-Term Memory (PostgreSQL + pgvector)
 
-**Purpose:** Persistent learning across sessions. High-confidence evidence influences future evaluations.
+**Purpose:** Persistent learning across sessions.
 
 #### Schema
 
 ```sql
 CREATE TABLE critic_acceptance_memory (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-    
-    -- Query context
     research_query TEXT NOT NULL,
     query_hash TEXT GENERATED ALWAYS AS (md5(lower(trim(research_query)))) STORED,
     query_embedding VECTOR(1536) NOT NULL,
-    
-    -- Paper identity
     pmid TEXT NOT NULL,
     study_type TEXT,
     publication_year INT,
-    
-    -- Critic-derived scores
-    relevance_score FLOAT CHECK (relevance_score BETWEEN 0 AND 1),
-    methodology_score FLOAT CHECK (methodology_score BETWEEN 0 AND 1),
-    quality_score FLOAT CHECK (quality_score BETWEEN 0 AND 1),
-    
-    -- CRAG context
+    relevance_score FLOAT,
+    methodology_score FLOAT,
+    quality_score FLOAT,
     iteration INT NOT NULL,
     accepted_at TIMESTAMP DEFAULT now()
 );
-
--- Indexes
-CREATE INDEX idx_query_hash ON critic_acceptance_memory (query_hash);
-CREATE INDEX idx_query_embedding ON critic_acceptance_memory 
-    USING ivfflat (query_embedding vector_cosine_ops) WITH (lists = 100);
 ```
 
-#### Memory Retrieval
-
-```python
-class CriticMemoryStore:
-    MAX_BOOST = 0.15           # Maximum threshold reduction
-    SIMILARITY_THRESHOLD = 0.75  # Minimum similarity for retrieval
-    DECAY_LAMBDA = 0.01         # Recency decay factor
-    
-    def fetch_memory_bias(self, query: str) -> float:
-        # 1. Try exact match (fast path)
-        rows = db.query("""
-            SELECT quality_score, accepted_at, 1.0 AS similarity
-            FROM critic_acceptance_memory
-            WHERE query_hash = md5(lower(trim(%s)))
-        """, query)
-        
-        # 2. Fall back to vector similarity
-        if not rows:
-            embedding = embed_query(query)
-            rows = db.query("""
-                SELECT quality_score, accepted_at,
-                       1 - (query_embedding <=> %s::vector) AS similarity
-                FROM critic_acceptance_memory
-                WHERE (1 - (query_embedding <=> %s::vector)) >= %s
-                ORDER BY similarity DESC LIMIT 10
-            """, embedding, embedding, SIMILARITY_THRESHOLD)
-        
-        # 3. Compute weighted score with recency decay
-        weighted_scores = []
-        for quality, accepted_at, similarity in rows:
-            age_days = (now - accepted_at).days
-            recency = exp(-DECAY_LAMBDA * age_days)
-            weighted_scores.append(quality * similarity * recency)
-        
-        # 4. Return bounded average
-        return min(mean(weighted_scores), MAX_BOOST)
-```
-
-#### Memory Influence (Safe, Bounded)
+#### Memory Influence
 
 ```
 Memory DOES:
-  ✓ Slightly lower quality threshold (max 0.15 reduction)
-  ✓ Enable faster convergence for seen queries
+  ✓ Lower quality threshold (max 0.15 reduction)
+  ✓ Enable faster convergence
   ✓ Remember high-quality evidence
 
 Memory DOES NOT:
   ✗ Skip paper evaluation
-  ✗ Force "sufficient" decision
-  ✗ Change individual paper grades
-  ✗ Reuse old papers without re-grading
-```
-
-**Safety Principle:** Memory influences thresholds, never decisions directly.
-
----
-
-## Configuration
-
-### Environment Variables
-
-| Variable | Description | Default |
-|----------|-------------|---------|
-| `DATABASE_URL` | PostgreSQL connection string | `postgresql://aesop:aesop_pass@postgres:5432/aesop_db` |
-| `REDIS_URL` | Redis connection string | `redis://redis:6379/0` |
-| `NEO4J_URI` | Neo4j bolt URI | `bolt://neo4j:7687` |
-| `NEO4J_USER` | Neo4j username | `neo4j` |
-| `NEO4J_PASSWORD` | Neo4j password | `aesop_graph_pass` |
-| `AWS_ACCESS_KEY_ID` | AWS credentials | Required |
-| `AWS_SECRET_ACCESS_KEY` | AWS credentials | Required |
-| `AWS_DEFAULT_REGION` | AWS region | `us-east-1` |
-| `LANGCHAIN_TRACING_V2` | Enable LangSmith | `false` |
-| `LANGCHAIN_API_KEY` | LangSmith API key | Optional |
-| `LANGCHAIN_PROJECT` | LangSmith project | `aesop-dev` |
-
-### CRAG Tuning Parameters
-
-Located in `backend/app/agents/critic/rubric.py`:
-
-```python
-# Evidence thresholds
-MIN_RELEVANCE_TO_KEEP = 0.45
-MIN_METHODOLOGY_TO_KEEP = 0.50
-
-# CRAG convergence
-MIN_AVG_QUALITY_FOR_SUFFICIENT = 0.60
-MAX_DISCARD_RATIO = 0.55
-
-# Iteration decay
-CONFIDENCE_DECAY_RATE = 0.07  # Per iteration
-MIN_CONFIDENCE_FLOOR = 0.45
-
-# Memory bounds
-MAX_MEMORY_BOOST = 0.15
+  ✗ Force decisions
+  ✗ Change individual grades
 ```
 
 ---
@@ -747,44 +697,58 @@ aesop/
 ├── backend/
 │   ├── app/
 │   │   ├── agents/
-│   │   │   ├── critic/
-│   │   │   │   ├── agent.py        # CriticAgent with CRAG logic
-│   │   │   │   ├── memory.py       # pgvector memory store
-│   │   │   │   ├── node.py         # LangGraph node
-│   │   │   │   ├── prompts.py      # Evaluation prompts
-│   │   │   │   ├── rubric.py       # GRADE-inspired thresholds
-│   │   │   │   └── schemas.py      # PaperGrade, Recommendation
-│   │   │   ├── scout/
-│   │   │   │   ├── agent.py        # Scout node with query expansion
-│   │   │   │   ├── prompts.py      # Expansion prompts
-│   │   │   │   └── tools.py        # PubMed API integration
-│   │   │   ├── synthesizer/
-│   │   │   │   ├── agent.py        # Synthesis generation
-│   │   │   │   ├── prompts.py      # Review structure prompts
-│   │   │   │   ├── schemas.py      # GradedPaper
-│   │   │   │   └── utils.py        # Paper formatting
+│   │   │   ├── intent/                 # Intent classification
+│   │   │   │   ├── __init__.py
+│   │   │   │   ├── agent.py            # Hybrid classifier
+│   │   │   │   ├── node.py             # LangGraph node
+│   │   │   │   └── prompts.py          # LLM prompts
+│   │   │   ├── chat/                   # Chat agent
+│   │   │   │   ├── __init__.py
+│   │   │   │   ├── agent.py            # Chat handler
+│   │   │   │   ├── node.py             # LangGraph node
+│   │   │   │   └── prompts.py          # Canned responses
+│   │   │   ├── utility/                # Utility agent
+│   │   │   │   ├── __init__.py
+│   │   │   │   ├── agent.py            # Reformatter
+│   │   │   │   └── node.py             # LangGraph node
 │   │   │   ├── router/
-│   │   │   │   ├── agent.py        # Multi-signal router
-│   │   │   │   ├── node.py         # Router LangGraph node
-│   │   │   │   └── prompts.py      # Classification prompts
+│   │   │   │   ├── agent.py            # Multi-signal router
+│   │   │   │   ├── node.py
+│   │   │   │   └── prompts.py
+│   │   │   ├── scout/
+│   │   │   │   ├── agent.py            # Query expansion + PubMed
+│   │   │   │   ├── prompts.py
+│   │   │   │   └── tools.py            # PubMed API
+│   │   │   ├── critic/
+│   │   │   │   ├── agent.py            # CRAG logic + retry
+│   │   │   │   ├── memory.py           # pgvector store
+│   │   │   │   ├── node.py
+│   │   │   │   ├── prompts.py
+│   │   │   │   ├── rubric.py           # GRADE thresholds
+│   │   │   │   └── schemas.py
+│   │   │   ├── synthesizer/
+│   │   │   │   ├── agent.py
+│   │   │   │   ├── prompts.py
+│   │   │   │   └── schemas.py
 │   │   │   ├── context_qa/
-│   │   │   │   ├── agent.py        # Direct Q&A from context
-│   │   │   │   └── node.py         # Context Q&A node
-│   │   │   ├── graph.py            # Original CRAG graph
-│   │   │   ├── orchestrator_graph.py  # Session-aware graph
-│   │   │   └── state.py            # AgentState, OrchestratorState
+│   │   │   │   ├── agent.py
+│   │   │   │   └── node.py
+│   │   │   ├── graph.py                # Original CRAG graph
+│   │   │   ├── orchestrator_graph.py   # Full orchestrator with intent
+│   │   │   └── state.py                # AgentState, OrchestratorState
 │   │   ├── schemas/
-│   │   │   └── session.py          # SessionContext, RouterDecision
+│   │   │   └── session.py              # SessionContext, RouterDecision
 │   │   ├── services/
-│   │   │   └── session.py          # Redis SessionService
+│   │   │   └── session.py              # Redis SessionService
 │   │   ├── embeddings/
-│   │   │   └── bedrock.py          # Titan embeddings + cosine sim
-│   │   ├── main.py                 # FastAPI application
-│   │   ├── tasks.py                # Review task runners
-│   │   └── logging.py              # Structured logging
+│   │   │   └── bedrock.py              # Titan embeddings
+│   │   ├── main.py                     # FastAPI with /chat endpoint
+│   │   ├── tasks.py                    # Task runners
+│   │   └── logging.py
+│   ├── tests/
+│   │   └── test_intent_classifier.py   # Intent classifier tests
 │   ├── db/
 │   │   └── migrations/
-│   │       └── 001_create_critic_memory.sql
 │   ├── Dockerfile
 │   └── pyproject.toml
 ├── docker-compose.yml
@@ -794,82 +758,59 @@ aesop/
 
 ---
 
-## Development
+## Configuration
 
-### Running Tests
+### Environment Variables
 
-```bash
-# Enter backend container
-docker exec -it aesop_backend bash
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `DATABASE_URL` | PostgreSQL connection | `postgresql://aesop:aesop_pass@postgres:5432/aesop_db` |
+| `REDIS_URL` | Redis connection | `redis://redis:6379/0` |
+| `AWS_ACCESS_KEY_ID` | AWS credentials | Required |
+| `AWS_SECRET_ACCESS_KEY` | AWS credentials | Required |
+| `AWS_DEFAULT_REGION` | AWS region | `us-east-1` |
+| `LANGCHAIN_TRACING_V2` | Enable LangSmith | `false` |
 
-# Run tests
-pytest tests/ -v
+### CRAG Tuning Parameters
 
-# Run specific test
-pytest tests/test_router.py -v
-```
+```python
+# Evidence thresholds
+MIN_RELEVANCE_TO_KEEP = 0.45
+MIN_METHODOLOGY_TO_KEEP = 0.50
+MIN_AVG_QUALITY_FOR_SUFFICIENT = 0.60
 
-### Local Development
+# Iteration decay
+CONFIDENCE_DECAY_RATE = 0.07
+MIN_CONFIDENCE_FLOOR = 0.45
 
-```bash
-# Install dependencies
-cd backend
-uv sync
-
-# Run locally (requires services running)
-uvicorn app.main:app --reload --port 8000
-```
-
-### Adding a New Agent
-
-1. Create directory: `backend/app/agents/your_agent/`
-2. Implement:
-   - `agent.py` - Core logic
-   - `node.py` - LangGraph node wrapper
-   - `prompts.py` - LLM prompts
-   - `schemas.py` - Pydantic models (if needed)
-3. Add node to graph in `orchestrator_graph.py`
-4. Update state in `state.py` if needed
-
-### Debugging
-
-```bash
-# View logs
-docker-compose logs -f backend
-
-# Check Redis sessions
-docker exec -it aesop_redis redis-cli
-> KEYS aesop:session:*
-> GET aesop:session:<session_id>
-
-# Check PostgreSQL memory
-docker exec -it aesop_postgres psql -U aesop -d aesop_db
-> SELECT COUNT(*) FROM critic_acceptance_memory;
-> SELECT research_query, quality_score FROM critic_acceptance_memory ORDER BY accepted_at DESC LIMIT 10;
+# Memory bounds
+MAX_MEMORY_BOOST = 0.15
 ```
 
 ---
 
 ## Performance
 
-### Latency Breakdown (Route A)
+### Latency by Route
 
-| Stage | Typical Duration |
-|-------|------------------|
-| Router | 200-500ms |
-| Scout (query expansion) | 1-3s |
-| Scout (PubMed fetch) | 5-15s |
-| Critic (per paper) | 1-2s |
-| Synthesizer | 5-20s |
-| **Total** | **15-45s** |
+| Route | Typical Duration | LLM Calls |
+|-------|------------------|-----------|
+| Chat | 50-500ms | 0-1 |
+| Utility | 500-2000ms | 1 |
+| Context Q&A | 1-3s | 2 |
+| Augmented | 10-25s | 3-5 |
+| Full Graph | 15-45s | 5-25 |
 
-### Cost Estimation
+### Cost by Route
 
-| Route | LLM Calls | Est. Cost |
-|-------|-----------|-----------|
-| Route A (Full) | Router + Scout + Critic×N + Synthesizer | $0.05-0.10 |
-| Route B (Augmented) | Router + Scout + Synthesizer | $0.03-0.06 |
-| Route C (Context Q&A) | Router + Context QA | $0.01-0.02 |
+| Route | Est. Cost |
+|-------|-----------|
+| Chat (canned) | $0.00 |
+| Chat (LLM) | $0.001 |
+| Utility | $0.002 |
+| Context Q&A | $0.01-0.02 |
+| Augmented | $0.03-0.06 |
+| Full Graph | $0.05-0.10 |
 
 ---
 
@@ -882,20 +823,55 @@ docker exec -it aesop_postgres psql -U aesop -d aesop_db
 - [x] Multi-turn session support
 - [x] Intelligent 3-route routing
 - [x] AWS Bedrock integration
+- [x] Intent classification (hybrid pattern + LLM)
+- [x] Chat agent with canned responses
+- [x] Utility agent for reformatting
+- [x] Throttling protection with retry
 
 ### In Progress 🚧
 
+- [ ] Chat memory (conversation history)
 - [ ] Neo4j citation graph integration
 - [ ] Streaming responses
-- [ ] Batch processing API
 
 ### Planned 📋
 
 - [ ] Full-text PDF retrieval
 - [ ] User feedback loop
-- [ ] Memory pruning/aging policies
+- [ ] Memory pruning policies
 - [ ] Evaluation benchmarks
 - [ ] Web UI
+
+---
+
+## Development
+
+### Running Tests
+
+```bash
+docker exec -it aesop_backend pytest tests/ -v
+```
+
+### View Logs
+
+```bash
+docker-compose logs -f backend
+```
+
+### Debug Redis Sessions
+
+```bash
+docker exec -it aesop_redis redis-cli
+> KEYS aesop:session:*
+> GET aesop:session:<session_id>
+```
+
+### Debug PostgreSQL Memory
+
+```bash
+docker exec -it aesop_postgres psql -U aesop -d aesop_db
+> SELECT COUNT(*) FROM critic_acceptance_memory;
+```
 
 ---
 

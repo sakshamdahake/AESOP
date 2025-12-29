@@ -1,9 +1,9 @@
 """
 Agent state models for AESOP system.
-Includes both original AgentState and new OrchestratorState.
+Includes both original AgentState and OrchestratorState with intent/chat support.
 """
 
-from typing import List, Optional
+from typing import List, Optional, Literal
 from pydantic import BaseModel, Field
 
 from app.agents.critic.schemas import PaperGrade
@@ -46,10 +46,14 @@ class AgentState(BaseModel):
     max_iterations: int = 1
 
 
+# Intent type definition
+IntentType = Literal["research", "followup_research", "chat", "utility"]
+
+
 class OrchestratorState(BaseModel):
     """
     Extended state for the session-aware orchestrator graph.
-    Includes routing decision and session context.
+    Includes intent classification, routing, and chat support.
     """
     # =====================
     # User input
@@ -58,11 +62,28 @@ class OrchestratorState(BaseModel):
     session_id: str = ""  # Empty string for new sessions
     
     # =====================
+    # Intent classification (NEW)
+    # =====================
+    intent: Optional[IntentType] = None
+    intent_confidence: Optional[float] = None
+    intent_reasoning: Optional[str] = None
+    
+    # =====================
+    # Chat response (NEW)
+    # =====================
+    chat_response: Optional[str] = None
+    
+    # =====================
+    # Utility response (NEW)
+    # =====================
+    utility_response: Optional[str] = None
+    
+    # =====================
     # Router output
     # =====================
     router_decision: Optional[RouterDecision] = None
     session_context: Optional[SessionContext] = None
-    route_taken: Optional[str] = None  # "full_graph" | "augmented_context" | "context_qa"
+    route_taken: Optional[str] = None  # "full_graph" | "augmented_context" | "context_qa" | "chat" | "utility"
     
     # =====================
     # Scout output (Route A & B)
@@ -85,7 +106,7 @@ class OrchestratorState(BaseModel):
     merged_papers: List[CachedPaper] = Field(default_factory=list)
     
     # =====================
-    # Synthesizer output (all routes)
+    # Synthesizer output (research routes)
     # =====================
     synthesis_output: Optional[str] = None
     
@@ -94,3 +115,14 @@ class OrchestratorState(BaseModel):
     # =====================
     iteration_count: int = 0
     max_iterations: int = 1
+    
+    def get_response(self) -> str:
+        """
+        Get the appropriate response based on route taken.
+        """
+        if self.route_taken == "chat":
+            return self.chat_response or ""
+        elif self.route_taken == "utility":
+            return self.utility_response or ""
+        else:
+            return self.synthesis_output or ""

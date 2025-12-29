@@ -1,6 +1,13 @@
 """
-Orchestrator Graph - Session-aware LangGraph with Router entry point.
-Implements 3-route execution model:
+Orchestrator Graph - Session-aware LangGraph with Intent classification.
+
+Flow:
+  Intent → (Chat | Utility | Router)
+  Router → (Route A | Route B | Route C)
+  
+Routes:
+- Chat: General conversation (no research)
+- Utility: Reformat existing output
 - Route A: Full Graph (Scout → Critic → Synthesizer)
 - Route B: Augmented Context (Scout → Merge → Synthesizer)  
 - Route C: Context Q&A (direct answer from cache)
@@ -10,6 +17,9 @@ from langgraph.graph import StateGraph, END
 from datetime import datetime
 
 from app.agents.state import OrchestratorState, Paper
+from app.agents.intent.node import intent_node
+from app.agents.chat.node import chat_node
+from app.agents.utility.node import utility_node
 from app.agents.router.node import router_node
 from app.agents.scout.agent import scout_node as original_scout_node
 from app.agents.critic.node import critic_node as original_critic_node
@@ -23,7 +33,7 @@ from app.logging import logger
 
 
 # ============================
-# Adapter Nodes
+# Adapter Nodes (unchanged from before)
 # ============================
 
 def scout_node(state: OrchestratorState) -> OrchestratorState:
@@ -192,28 +202,27 @@ def merge_node(state: OrchestratorState) -> OrchestratorState:
 def save_session_node(state: OrchestratorState) -> OrchestratorState:
     """
     Save session context for future queries.
-    Route C only extends TTL (no content update).
+    Chat and Utility routes don't update session (just extend TTL if exists).
     """
     session_service = get_session_service()
     
-    # Route C: Just extend TTL
-    if state.route_taken == "context_qa":
-        session_service.extend_ttl(state.session_id)
-        logger.info(f"SESSION_TTL_EXTENDED session_id={state.session_id}")
+    route_taken = state.route_taken
+    session_id = state.session_id
+    query = state.query
+    
+    # Chat/Utility/Context QA: Just extend TTL if session exists
+    if route_taken in ("chat", "utility", "context_qa"):
+        if session_id:
+            session_service.extend_ttl(session_id)
+            logger.info(f"SESSION_TTL_EXTENDED session_id={session_id} route={route_taken}")
         return state
     
     # Route A/B: Save full context
-    query_embedding = embed_query(state.query)
+    if not session_id:
+        # No session to save to
+        return state
     
-    logger.info(
-        "SAVE_SESSION_EMBEDDING",
-        extra={
-            "query": state.query[:50],
-            "embedding_length": len(query_embedding),
-            "embedding_sample": query_embedding[:5],  # First 5 values for debug
-        },
-    )
-    
+    query_embedding = embed_query(query)
     
     # Convert papers to CachedPaper format with grades
     cached_papers = []
@@ -259,11 +268,11 @@ def save_session_node(state: OrchestratorState) -> OrchestratorState:
     created_at = existing.created_at if existing else datetime.utcnow()
     
     # Truncate synthesis for caching
-    synthesis_summary = (state.synthesis_output or "")[:1000]
+    synthesis_summary = (state.synthesis_output or "")[:1500]
     
     context = SessionContext(
-        session_id=state.session_id,
-        original_query=state.query,
+        session_id=session_id,
+        original_query=query,
         query_embedding=query_embedding,
         retrieved_papers=cached_papers[:15],  # Cap storage
         synthesis_summary=synthesis_summary,
@@ -277,11 +286,30 @@ def save_session_node(state: OrchestratorState) -> OrchestratorState:
 
 
 # ============================
-# Routing Logic
+# Intent-Based Routing
 # ============================
 
-def route_decision(state: OrchestratorState) -> str:
-    """Conditional edge function after router."""
+def route_by_intent(state: OrchestratorState) -> str:
+    """
+    Route based on classified intent.
+    """
+    intent = state.intent
+    
+    if intent == "chat":
+        return "chat"
+    elif intent == "utility":
+        return "utility"
+    elif intent in ("research", "followup_research"):
+        return "router"
+    else:
+        # Default to router (research)
+        return "router"
+
+
+def route_by_router_decision(state: OrchestratorState) -> str:
+    """
+    Route based on Router agent's decision (for research intents).
+    """
     if state.router_decision is None:
         return "scout"  # Fallback
     
@@ -312,11 +340,24 @@ def crag_routing(state: OrchestratorState) -> str:
 # ============================
 
 def build_orchestrator_graph():
-    """Build the session-aware orchestrator graph."""
+    """
+    Build the intent-aware orchestrator graph.
+    
+    Flow:
+        Intent → Chat (if chat intent)
+               → Utility (if utility intent)
+               → Router (if research/followup intent)
+                   → Scout → Critic → Synthesizer (Route A)
+                   → Scout → Merge → Synthesizer (Route B)
+                   → Context Q&A (Route C)
+    """
     
     graph = StateGraph(OrchestratorState)
     
-    # Add nodes
+    # Add all nodes
+    graph.add_node("intent", intent_node)
+    graph.add_node("chat", chat_node)
+    graph.add_node("utility", utility_node)
     graph.add_node("router", router_node)
     graph.add_node("scout", scout_node)
     graph.add_node("critic", critic_node)
@@ -326,13 +367,30 @@ def build_orchestrator_graph():
     graph.add_node("context_qa", context_qa_node)
     graph.add_node("save_session", save_session_node)
     
-    # Entry point
-    graph.set_entry_point("router")
+    # Entry point: Intent classification
+    graph.set_entry_point("intent")
+    
+    # Intent → (Chat | Utility | Router)
+    graph.add_conditional_edges(
+        "intent",
+        route_by_intent,
+        {
+            "chat": "chat",
+            "utility": "utility",
+            "router": "router",
+        },
+    )
+    
+    # Chat → Save Session → END
+    graph.add_edge("chat", "save_session")
+    
+    # Utility → Save Session → END
+    graph.add_edge("utility", "save_session")
     
     # Router → Routes
     graph.add_conditional_edges(
         "router",
-        route_decision,
+        route_by_router_decision,
         {
             "scout": "scout",
             "scout_augmented": "scout_augmented",
@@ -358,7 +416,7 @@ def build_orchestrator_graph():
     # Route C: Context Q&A
     graph.add_edge("context_qa", "save_session")
     
-    # All synthesis paths → save session → END
+    # Synthesizer → Save Session → END
     graph.add_edge("synthesizer", "save_session")
     graph.add_edge("save_session", END)
     
