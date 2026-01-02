@@ -23,14 +23,20 @@ def run_orchestrated_review(
     session_id: str = None,
 ) -> dict:
     """
-    Session-aware multi-turn review.
+    Session-aware multi-turn review with intent classification.
+    
+    Handles:
+    - Chat (greetings, thanks, system questions)
+    - Utility (reformat existing output)
+    - Research (full literature search)
+    - Follow-up research (context-aware queries)
     
     Args:
-        query: Research question
+        query: User message
         session_id: Optional session ID for follow-ups
         
     Returns:
-        dict with response, session_id, route_taken, papers_count
+        dict with response, session_id, route_taken, intent, etc.
     """
     # Generate session ID if not provided
     if not session_id:
@@ -41,10 +47,20 @@ def run_orchestrated_review(
         session_id=session_id,
     )
     
-    # LangGraph returns a dict, NOT a Pydantic model
+    # LangGraph returns a dict
     final_state = orchestrator_graph.invoke(initial_state)
     
-    # Use dict access (.get()) instead of attribute access
+    # Determine the response based on route taken
+    route_taken = final_state.get("route_taken") or "unknown"
+    
+    if route_taken == "chat":
+        response = final_state.get("chat_response") or ""
+    elif route_taken == "utility":
+        response = final_state.get("utility_response") or ""
+    else:
+        response = final_state.get("synthesis_output") or ""
+    
+    # Determine paper count
     papers_count = 0
     if final_state.get("merged_papers"):
         papers_count = len(final_state["merged_papers"])
@@ -52,16 +68,17 @@ def run_orchestrated_review(
         papers_count = len(final_state["retrieved_papers"])
     elif final_state.get("session_context"):
         session_ctx = final_state["session_context"]
-        # session_context might be a dict or Pydantic model
         if hasattr(session_ctx, "retrieved_papers"):
             papers_count = len(session_ctx.retrieved_papers)
         elif isinstance(session_ctx, dict):
             papers_count = len(session_ctx.get("retrieved_papers", []))
     
     return {
-        "response": final_state.get("synthesis_output") or "",
+        "response": response,
         "session_id": session_id,
-        "route_taken": final_state.get("route_taken") or "unknown",
+        "route_taken": route_taken,
+        "intent": final_state.get("intent"),
+        "intent_confidence": final_state.get("intent_confidence"),
         "papers_count": papers_count,
         "critic_decision": final_state.get("critic_decision"),
         "avg_quality": final_state.get("avg_quality"),

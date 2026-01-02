@@ -37,6 +37,7 @@ services:
       - POSTGRES_DB=aesop_db
     volumes:
       - postgres_data:/var/lib/postgresql/data
+      - ./backend/db/migrations:/docker-entrypoint-initdb.d
 
   # --- 3. Queue & Cache (Redis) ---
   redis:
