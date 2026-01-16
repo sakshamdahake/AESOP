@@ -7,6 +7,7 @@ import uuid
 from app.agents.graph import aesop_graph
 from app.agents.orchestrator_graph import orchestrator_graph
 from app.agents.state import AgentState, OrchestratorState
+from app.schemas.session import StructuredAnswer, AnswerSection
 
 
 def run_review(query: str) -> AgentState:
@@ -20,7 +21,7 @@ def run_review(query: str) -> AgentState:
 
 def run_orchestrated_review(
     query: str,
-    session_id: str = None,
+    session_id: str = None, # type: ignore
 ) -> dict:
     """
     Session-aware multi-turn review with intent classification.
@@ -73,6 +74,9 @@ def run_orchestrated_review(
         elif isinstance(session_ctx, dict):
             papers_count = len(session_ctx.get("retrieved_papers", []))
     
+    # Create structured answer from flat response
+    structured_answer = StructuredAnswer.from_flat_response(response)
+    
     return {
         "response": response,
         "session_id": session_id,
@@ -82,4 +86,31 @@ def run_orchestrated_review(
         "papers_count": papers_count,
         "critic_decision": final_state.get("critic_decision"),
         "avg_quality": final_state.get("avg_quality"),
+        "structured_answer": structured_answer,
+    }
+
+
+def create_metadata_dict(
+    route_taken: str,
+    intent: str = None, # type: ignore
+    intent_confidence: float = None, # type: ignore
+    papers_count: int = 0,
+    critic_decision: str = None, # type: ignore
+    avg_quality: float = None, # type: ignore
+) -> dict:
+    """
+    Create metadata dict with renamed fields per API spec.
+    
+    Field mappings:
+    - route_taken -> processing_route
+    - critic_decision -> review_outcome
+    - avg_quality -> evidence_score
+    """
+    return {
+        "processing_route": route_taken,
+        "intent": intent,
+        "intent_confidence": intent_confidence,
+        "papers_count": papers_count,
+        "review_outcome": critic_decision,
+        "evidence_score": avg_quality,
     }

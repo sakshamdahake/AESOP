@@ -3,7 +3,7 @@ Session schemas for multi-turn conversation orchestration.
 """
 
 from datetime import datetime
-from typing import List, Optional, Literal
+from typing import List, Optional, Literal, Union
 from pydantic import BaseModel, Field
 import json
 
@@ -20,6 +20,29 @@ class CachedPaper(BaseModel):
     quality_score: Optional[float] = None
     recommendation: Optional[str] = None
 
+class AnswerSection(BaseModel):
+    """A single section of a structured answer."""
+    type: Literal["summary", "evidence", "methodology", "limitations", "recommendations"]
+    content: str
+
+
+class StructuredAnswer(BaseModel):
+    """Structured answer with typed sections."""
+    sections: List[AnswerSection] = Field(default_factory=list)
+    
+    @classmethod
+    def from_flat_response(cls, response: str) -> "StructuredAnswer":
+        """Convert a flat response string into a structured answer (single summary section)."""
+        return cls(sections=[AnswerSection(type="summary", content=response)])
+
+class SessionMessage(BaseModel):
+    """A single message in the session history."""
+    role: Literal["user", "assistant"]
+    content: Optional[str] = None  # For user messages
+    answer: Optional[StructuredAnswer] = None  # For assistant messages
+    timestamp: datetime = Field(default_factory=datetime.utcnow)
+    metadata: Optional[dict] = None  # For intent, confidence, route, etc.
+
 
 class SessionContext(BaseModel):
     """
@@ -32,6 +55,10 @@ class SessionContext(BaseModel):
     
     retrieved_papers: List[CachedPaper] = Field(default_factory=list)
     synthesis_summary: str = ""
+    
+    title: Optional[str] = None
+    
+    messages: List[SessionMessage] = Field(default_factory=list)
     
     turn_count: int = 1
     created_at: datetime = Field(default_factory=datetime.utcnow)
@@ -55,6 +82,22 @@ class SessionContext(BaseModel):
         except Exception as e:
             raise ValueError(f"Failed to deserialize SessionContext: {e}")
     
+    def add_user_message(self, content: str) -> None:
+        """Add a user message to history."""
+        self.messages.append(SessionMessage(role="user", content=content))
+    
+    def add_assistant_message(
+        self,
+        answer: StructuredAnswer,
+        metadata: Optional[dict] = None,
+    ) -> None:
+        """Add an assistant message to history."""
+        self.messages.append(SessionMessage(
+            role="assistant",
+            answer=answer,
+            metadata=metadata,
+        ))
+    
     def get_papers_context(self, max_papers: int = 10) -> str:
         """Format papers for LLM context injection."""
         if not self.retrieved_papers:
@@ -70,6 +113,14 @@ class SessionContext(BaseModel):
                 f"Abstract: {paper.abstract[:600]}..."
             )
         return "\n\n---\n\n".join(blocks)
+    
+    def generate_title(self) -> str:
+        """Generate title from original query (truncated)."""
+        if self.title:
+            return self.title
+        if len(self.original_query) > 50:
+            return self.original_query[:47] + "..."
+        return self.original_query
 
 
 class RouterDecision(BaseModel):

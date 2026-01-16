@@ -4,15 +4,16 @@ Uses sync Redis client to match existing sync architecture.
 """
 
 import redis
-from typing import Optional
+from typing import Optional, List
 from datetime import datetime
 
-from app.schemas.session import SessionContext, CachedPaper
+from app.schemas.session import SessionContext, CachedPaper, StructuredAnswer, SessionMessage
 from app.logging import logger
 
 # Configuration
 SESSION_TTL_SECONDS = 60 * 60  # 60 minutes
 REDIS_KEY_PREFIX = "aesop:session:"
+REDIS_SESSION_LIST_KEY = "aesop:sessions"
 REDIS_URL = "redis://redis:6379/0"
 
 
@@ -61,15 +62,27 @@ class SessionService:
     def save_session(self, context: SessionContext) -> bool:
         """
         Save or update session context in Redis.
-        Automatically sets TTL.
+        Automatically sets TTL and updates session list.
         """
         try:
             context.updated_at = datetime.utcnow()
+            
+            # Generate title if not set
+            if not context.title:
+                context.title = context.generate_title()
+            
             self._client.setex(
                 self._key(context.session_id),
                 SESSION_TTL_SECONDS,
                 context.to_redis(),
             )
+            
+            # Add to session list (sorted set with timestamp as score)
+            self._client.zadd(
+                REDIS_SESSION_LIST_KEY,
+                {context.session_id: context.updated_at.timestamp()},
+            )
+            
             logger.info(
                 "SESSION_SAVED",
                 extra={
@@ -87,6 +100,123 @@ class SessionService:
             )
             return False
     
+    def create_session(
+        self,
+        session_id: str,
+        initial_message: Optional[str] = None,
+        title: Optional[str] = None,
+    ) -> SessionContext:
+        """
+        Create a new session.
+        
+        Args:
+            session_id: UUID for the session
+            initial_message: Optional first message to store
+            title: Optional custom title
+            
+        Returns:
+            New SessionContext
+        """
+        now = datetime.utcnow()
+        context = SessionContext(
+            session_id=session_id,
+            original_query=initial_message or "",
+            title=title or (initial_message[:47] + "..." if initial_message and len(initial_message) > 50 else initial_message),
+            messages=[],
+            turn_count=0,
+            created_at=now,
+            updated_at=now,
+        )
+        
+        # Add initial user message if provided
+        if initial_message:
+            context.add_user_message(initial_message)
+        
+        self.save_session(context)
+        return context
+    
+    def list_sessions(self, limit: int = 50, offset: int = 0) -> List[dict]:
+        """
+        List all sessions sorted by last update time (newest first).
+        
+        Returns list of session summaries with id, title, updated_at.
+        """
+        try:
+            # Get session IDs from sorted set (newest first)
+            session_ids = self._client.zrevrange(
+                REDIS_SESSION_LIST_KEY,
+                offset,
+                offset + limit - 1,
+            )
+            
+            sessions = []
+            expired_ids = []
+            
+            for session_id in session_ids:
+                context = self.get_session(session_id)
+                if context:
+                    sessions.append({
+                        "session_id": context.session_id,
+                        "title": context.title or context.generate_title(),
+                        "updated_at": context.updated_at,
+                        "message_count": len(context.messages),
+                    })
+                else:
+                    # Session expired, mark for cleanup
+                    expired_ids.append(session_id)
+            
+            # Clean up expired sessions from list
+            if expired_ids:
+                self._client.zrem(REDIS_SESSION_LIST_KEY, *expired_ids)
+            
+            return sessions
+            
+        except Exception as e:
+            logger.error(
+                "SESSION_LIST_ERROR",
+                extra={"error": str(e)},
+            )
+            return []
+    
+    def update_session_title(self, session_id: str, title: str) -> bool:
+        """Update the title of a session."""
+        context = self.get_session(session_id)
+        if not context:
+            return False
+        
+        context.title = title
+        return self.save_session(context)
+    
+    def add_message_to_session(
+        self,
+        session_id: str,
+        role: str,
+        content: Optional[str] = None,
+        answer: Optional[StructuredAnswer] = None,
+        metadata: Optional[dict] = None,
+    ) -> bool:
+        """
+        Add a message to session history.
+        
+        Args:
+            session_id: Session to update
+            role: 'user' or 'assistant'
+            content: Message content (for user messages)
+            answer: Structured answer (for assistant messages)
+            metadata: Optional metadata (for assistant messages)
+        """
+        context = self.get_session(session_id)
+        if not context:
+            return False
+        
+        if role == "user":
+            context.add_user_message(content)
+        else:
+            context.add_assistant_message(answer, metadata)
+        
+        context.turn_count += 1
+        return self.save_session(context)
+    
     def extend_ttl(self, session_id: str) -> bool:
         """Extend TTL without modifying content (for Route C)."""
         try:
@@ -101,7 +231,12 @@ class SessionService:
     def delete_session(self, session_id: str) -> bool:
         """Manually invalidate a session."""
         try:
+            # Remove from session data
             deleted = self._client.delete(self._key(session_id))
+            
+            # Remove from session list
+            self._client.zrem(REDIS_SESSION_LIST_KEY, session_id)
+            
             logger.info(
                 "SESSION_DELETED",
                 extra={"session_id": session_id, "deleted": bool(deleted)},
