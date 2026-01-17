@@ -87,6 +87,16 @@ class RouterAgent:
                 is_new_session=True,
             )
         
+        # Fast path: Session exists but has no original query (empty session)
+        if not session_context.original_query:
+            logger.info("ROUTER_FAST_PATH route=full_graph reason=empty_session")
+            return RouterDecision(
+                route="full_graph",
+                reasoning="Session exists but has no previous query context",
+                similarity_score=0.0,
+                is_new_session=True,
+            )
+        
         # Signal 1: Check for context reference patterns
         has_context_reference, reference_type = self._detect_context_references(current_query)
         
@@ -98,10 +108,17 @@ class RouterAgent:
         
         # Signal 3: Embedding similarity (secondary signal)
         current_embedding = embed_query(current_query)
-        embedding_similarity = cosine_similarity(
-            current_embedding,
-            session_context.query_embedding,
-        )
+        
+        # Handle empty session embedding (new session without full orchestration)
+        if session_context.query_embedding and len(session_context.query_embedding) > 0:
+            embedding_similarity = cosine_similarity(
+                current_embedding,
+                session_context.query_embedding,
+            )
+        else:
+            # No stored embedding, default to 0 (will rely on other signals)
+            embedding_similarity = 0.0
+            logger.debug("ROUTER_EMPTY_EMBEDDING: Session has no stored embedding, using 0.0")
         
         # Signal 4: Check for new topic indicators
         has_new_topic_pattern = self._detect_new_topic(current_query)
