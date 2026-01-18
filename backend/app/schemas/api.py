@@ -1,6 +1,8 @@
 """
 API Request/Response schemas for AESOP endpoints.
 Implements REST-compliant session and message handling.
+
+# backend/app/schemas/api.py
 """
 
 from datetime import datetime

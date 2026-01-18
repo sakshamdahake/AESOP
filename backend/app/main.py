@@ -2,6 +2,8 @@
 AESOP FastAPI Application
 
 API v2.0 with RESTful session and message handling.
+
+# app/main.py
 """
 
 from fastapi import FastAPI, HTTPException, Query
@@ -18,6 +20,7 @@ from neo4j import GraphDatabase
 import redis.asyncio as aioredis
 
 from app.tasks import run_review, run_orchestrated_review, create_metadata_dict
+from app.services.database import get_database_service
 from app.services.session import get_session_service
 from app.schemas.session import StructuredAnswer, AnswerSection
 from app.schemas.api import (
@@ -64,6 +67,13 @@ async def lifespan(app: FastAPI):
         print("Postgres (with pgvector) connected.")
     except Exception as e:
         print(f"Postgres Failed: {e}")
+
+    try:
+        db_service = get_database_service()
+        db_service.initialize()
+        print("PostgreSQL connection pool initialized.")
+    except Exception as e:
+        print(f"PostgreSQL pool initialization failed: {e}")
 
     # Check Redis
     try:
@@ -184,6 +194,10 @@ def create_session(request: CreateSessionRequest = None):
             ),
         )
         session_service.save_session(context)
+
+        # 🆕 Save research context to PostgreSQL (if research was done)
+        if result.get("route_taken") in ["full_graph", "augmented_context"]:
+            _save_research_to_db(session_id, result)
         
         initial_response = MessageResponse(
             answer=result["structured_answer"],
@@ -400,6 +414,10 @@ def send_message(session_id: str, request: SendMessageRequest):
             session.title = session.generate_title()
         
         session_service.save_session(session)
+
+        # 🆕 Save research context to PostgreSQL (if research was done)
+        if result.get("route_taken") in ["full_graph", "augmented_context"]:
+            _save_research_to_db(session_id, result)
         
         return MessageResponse(
             answer=result["structured_answer"],
@@ -516,6 +534,88 @@ def send_message_stream(session_id: str, request: SendMessageRequest):
         media_type="application/x-ndjson",
     )
 
+
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+
+def _save_research_to_db(session_id: str, result: dict):
+    """
+    Save research context and papers to PostgreSQL.
+    Called after orchestrated review for research routes.
+    """
+    from app.services.database import get_database_service
+    from app.embeddings.bedrock import embed_query
+    
+    db = get_database_service()
+    
+    try:
+        # Get query and create embedding
+        query = result.get("structured_answer", {}).get("sections", [{}])[0].get("content", "")[:200]
+        query_embedding = None
+        
+        # Create research context
+        context_id = db.create_research_context(
+            session_id=session_id,
+            research_query=query,
+            query_embedding=query_embedding,
+            synthesis_summary=result.get("response", ""),
+            route_taken=result.get("route_taken"),
+            intent=result.get("intent"),
+            intent_confidence=result.get("intent_confidence"),
+            papers_count=result.get("papers_count", 0),
+            critic_decision=result.get("critic_decision"),
+            avg_quality=result.get("avg_quality"),
+        )
+        
+        # Save papers if available
+        papers_data = []
+        
+        # Extract papers from result (they might be in different places)
+        if result.get("merged_papers"):
+            papers_data = result["merged_papers"]
+        elif result.get("retrieved_papers"):
+            papers_data = result["retrieved_papers"]
+        
+        if papers_data:
+            # Convert papers to dict format
+            papers_to_save = []
+            for paper in papers_data[:15]:  # Cap at 15 papers
+                paper_dict = {
+                    "pmid": paper.pmid if hasattr(paper, "pmid") else paper.get("pmid"),
+                    "title": paper.title if hasattr(paper, "title") else paper.get("title"),
+                    "abstract": paper.abstract if hasattr(paper, "abstract") else paper.get("abstract"),
+                    "publication_year": paper.publication_year if hasattr(paper, "publication_year") else paper.get("publication_year"),
+                    "journal": paper.journal if hasattr(paper, "journal") else paper.get("journal"),
+                    "relevance_score": paper.relevance_score if hasattr(paper, "relevance_score") else paper.get("relevance_score"),
+                    "methodology_score": paper.methodology_score if hasattr(paper, "methodology_score") else paper.get("methodology_score"),
+                    "quality_score": paper.quality_score if hasattr(paper, "quality_score") else paper.get("quality_score"),
+                    "recommendation": paper.recommendation if hasattr(paper, "recommendation") else paper.get("recommendation"),
+                    "study_type": paper.get("study_type") if isinstance(paper, dict) else None,
+                }
+                papers_to_save.append(paper_dict)
+            
+            db.add_research_papers(context_id, papers_to_save)
+            
+            logger.info(
+                "RESEARCH_SAVED_TO_DB",
+                extra={
+                    "session_id": session_id,
+                    "context_id": context_id,
+                    "papers_count": len(papers_to_save),
+                }
+            )
+    
+    except Exception as e:
+        logger.error(
+            "RESEARCH_SAVE_TO_DB_FAILED",
+            extra={
+                "session_id": session_id,
+                "error": str(e),
+            }
+        )
+        # Don't fail the request if DB save fails
 
 # =============================================================================
 # LEGACY ENDPOINTS (DEPRECATED - MAINTAINED FOR BACKWARD COMPATIBILITY)

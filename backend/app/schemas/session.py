@@ -1,9 +1,12 @@
 """
 Session schemas for multi-turn conversation orchestration.
+Updated to support both Redis (cache) and PostgreSQL (persistence).
+
+backend/app/schemas/session.py
 """
 
 from datetime import datetime
-from typing import List, Optional, Literal, Union
+from typing import List, Optional, Literal, Dict, Any
 from pydantic import BaseModel, Field
 import json
 
@@ -20,6 +23,7 @@ class CachedPaper(BaseModel):
     quality_score: Optional[float] = None
     recommendation: Optional[str] = None
 
+
 class AnswerSection(BaseModel):
     """A single section of a structured answer."""
     type: Literal["summary", "evidence", "methodology", "limitations", "recommendations"]
@@ -34,6 +38,18 @@ class StructuredAnswer(BaseModel):
     def from_flat_response(cls, response: str) -> "StructuredAnswer":
         """Convert a flat response string into a structured answer (single summary section)."""
         return cls(sections=[AnswerSection(type="summary", content=response)])
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dict for JSON storage."""
+        return {"sections": [{"type": s.type, "content": s.content} for s in self.sections]}
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "StructuredAnswer":
+        """Create from dict (from database JSONB)."""
+        if not data or "sections" not in data:
+            return cls(sections=[])
+        return cls(sections=[AnswerSection(**s) for s in data["sections"]])
+
 
 class SessionMessage(BaseModel):
     """A single message in the session history."""
@@ -41,13 +57,42 @@ class SessionMessage(BaseModel):
     content: Optional[str] = None  # For user messages
     answer: Optional[StructuredAnswer] = None  # For assistant messages
     timestamp: datetime = Field(default_factory=datetime.utcnow)
-    metadata: Optional[dict] = None  # For intent, confidence, route, etc.
+    metadata: Optional[Dict[str, Any]] = None  # For intent, confidence, route, etc.
+    
+    # 🆕 Optional database fields
+    id: Optional[str] = None  # Database message ID
+    
+    def to_db_dict(self) -> Dict[str, Any]:
+        """Convert to dict for database storage."""
+        return {
+            "role": self.role,
+            "content": self.content,
+            "answer": self.answer.to_dict() if self.answer else None,
+            "metadata": self.metadata,
+        }
+    
+    @classmethod
+    def from_db_dict(cls, data: Dict[str, Any]) -> "SessionMessage":
+        """Create from database dict."""
+        return cls(
+            id=data.get("id"),
+            role=data["role"],
+            content=data.get("content"),
+            answer=StructuredAnswer.from_dict(data["answer"]) if data.get("answer") else None,
+            metadata=data.get("metadata"),
+            timestamp=data.get("created_at", datetime.utcnow()),
+        )
 
 
 class SessionContext(BaseModel):
     """
-    Cached context from previous query in the session.
-    Stored in Redis with TTL of 60 minutes.
+    Session context for multi-turn conversations.
+    
+    Supports both:
+    - Redis (cache layer, fast access)
+    - PostgreSQL (persistence layer, permanent storage)
+    
+    All new fields are Optional to maintain backward compatibility.
     """
     session_id: str
     original_query: str
@@ -63,6 +108,11 @@ class SessionContext(BaseModel):
     turn_count: int = 1
     created_at: datetime = Field(default_factory=datetime.utcnow)
     updated_at: datetime = Field(default_factory=datetime.utcnow)
+    
+    # 🆕 Optional database fields (for PostgreSQL persistence)
+    anonymous_id: Optional[str] = None  # User tracking (optional)
+    deleted_at: Optional[datetime] = None  # Soft delete timestamp
+    persisted: bool = False  # Flag: has this been saved to DB?
     
     def to_redis(self) -> str:
         """Serialize for Redis storage."""
@@ -89,7 +139,7 @@ class SessionContext(BaseModel):
     def add_assistant_message(
         self,
         answer: StructuredAnswer,
-        metadata: Optional[dict] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Add an assistant message to history."""
         self.messages.append(SessionMessage(
@@ -121,6 +171,36 @@ class SessionContext(BaseModel):
         if len(self.original_query) > 50:
             return self.original_query[:47] + "..."
         return self.original_query
+    
+    def get_recent_messages_for_context(self, limit: int = 6) -> str:
+        """
+        Format recent messages for LLM context injection.
+        Used by Intent Classifier and Chat Agent.
+        
+        Args:
+            limit: Number of recent messages to include (default 6)
+        
+        Returns:
+            Formatted string of recent messages
+        """
+        if not self.messages:
+            return "No previous messages."
+        
+        recent = self.messages[-limit:] if len(self.messages) > limit else self.messages
+        
+        formatted = []
+        for msg in recent:
+            if msg.role == "user":
+                formatted.append(f"User: {msg.content}")
+            else:
+                # For assistant, show first section content (summary)
+                if msg.answer and msg.answer.sections:
+                    content = msg.answer.sections[0].content[:200]
+                    formatted.append(f"Assistant: {content}...")
+                else:
+                    formatted.append("Assistant: [No content]")
+        
+        return "\n".join(formatted)
 
 
 class RouterDecision(BaseModel):

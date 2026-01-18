@@ -4,7 +4,8 @@ from langchain_core.tracers.context import tracing_v2_enabled
 from app.agents.state import AgentState
 from app.agents.critic.agent import CriticAgent
 from app.logging import logger
-
+import time
+from botocore.exceptions import ClientError
 
 # ============================
 # LLM configuration (Bedrock)

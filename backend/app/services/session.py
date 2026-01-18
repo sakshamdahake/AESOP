@@ -1,13 +1,32 @@
 """
-Redis-based session management for multi-turn conversations.
-Uses sync Redis client to match existing sync architecture.
+Hybrid Session Service - Redis (cache) + PostgreSQL (persistence).
+
+Architecture:
+- Redis: Fast cache for active sessions (60min TTL)
+- PostgreSQL: Permanent storage (forever)
+- Write-through: Every change goes to both
+
+Strategy:
+- get_session(): Try Redis → If miss, load from DB → Cache in Redis
+- save_session(): Write to Redis + Write to PostgreSQL
+- create_session(): Write to both immediately
+- delete_session(): Soft delete in DB + Remove from Redis
+
+backend/app/services/session.py
 """
 
 import redis
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 from datetime import datetime
 
-from app.schemas.session import SessionContext, CachedPaper, StructuredAnswer, SessionMessage
+from app.schemas.session import (
+    SessionContext,
+    SessionMessage,
+    CachedPaper,
+    StructuredAnswer,
+)
+from app.services.database import get_database_service
+from app.embeddings.bedrock import embed_query
 from app.logging import logger
 
 # Configuration
@@ -19,105 +38,198 @@ REDIS_URL = "redis://redis:6379/0"
 
 class SessionService:
     """
-    Manages session context in Redis for multi-turn conversations.
+    Hybrid session management: Redis (cache) + PostgreSQL (persistence).
+    
     SYNC implementation to match existing codebase.
     """
     
     def __init__(self, redis_url: str = REDIS_URL):
-        self._client = redis.from_url(redis_url, decode_responses=True)
+        self._redis = redis.from_url(redis_url, decode_responses=True)
+        self._db = get_database_service()
     
-    def _key(self, session_id: str) -> str:
+    def _redis_key(self, session_id: str) -> str:
         """Generate Redis key for session."""
         return f"{REDIS_KEY_PREFIX}{session_id}"
     
+    # ========================================================================
+    # GET SESSION (with cache-aside pattern)
+    # ========================================================================
+    
     def get_session(self, session_id: str) -> Optional[SessionContext]:
         """
-        Retrieve session context from Redis.
-        Returns None if session doesn't exist or has expired.
+        Get session with cache-aside pattern.
+        
+        Flow:
+        1. Try Redis (fast)
+        2. If miss, try PostgreSQL
+        3. If found in DB, cache in Redis
+        4. Return session or None
         """
+        # 1. Try Redis first (fast path)
         try:
-            data = self._client.get(self._key(session_id))
-            if data is None:
-                logger.debug(f"SESSION_NOT_FOUND session_id={session_id}")
+            redis_data = self._redis.get(self._redis_key(session_id))
+            if redis_data:
+                context = SessionContext.from_redis(redis_data)
+                logger.debug(
+                    "SESSION_CACHE_HIT",
+                    extra={"session_id": session_id}
+                )
+                return context
+        except Exception as e:
+            logger.warning(
+                "SESSION_REDIS_GET_ERROR",
+                extra={"session_id": session_id, "error": str(e)}
+            )
+            # Continue to DB lookup
+        
+        # 2. Redis miss - try PostgreSQL
+        try:
+            db_session = self._db.get_session(session_id, include_messages=True)
+            if not db_session:
+                logger.debug(
+                    "SESSION_NOT_FOUND",
+                    extra={"session_id": session_id}
+                )
                 return None
             
-            context = SessionContext.from_redis(data)
+            # 3. Convert DB record to SessionContext
+            context = self._db_record_to_session_context(db_session)
+            
+            # 4. Cache in Redis for future requests
+            try:
+                self._redis.setex(
+                    self._redis_key(session_id),
+                    SESSION_TTL_SECONDS,
+                    context.to_redis(),
+                )
+                logger.debug(
+                    "SESSION_CACHED_FROM_DB",
+                    extra={"session_id": session_id}
+                )
+            except Exception as e:
+                logger.warning(
+                    "SESSION_REDIS_CACHE_ERROR",
+                    extra={"session_id": session_id, "error": str(e)}
+                )
+            
             logger.info(
-                "SESSION_RETRIEVED",
+                "SESSION_LOADED_FROM_DB",
                 extra={
                     "session_id": session_id,
-                    "turn_count": context.turn_count,
-                    "papers_cached": len(context.retrieved_papers),
-                },
+                    "message_count": len(context.messages),
+                }
             )
+            
             return context
             
         except Exception as e:
             logger.error(
-                "SESSION_GET_ERROR",
-                extra={"session_id": session_id, "error": str(e)},
+                "SESSION_DB_GET_ERROR",
+                extra={"session_id": session_id, "error": str(e)}
             )
             return None
     
+    # ========================================================================
+    # SAVE SESSION (write-through to both Redis and PostgreSQL)
+    # ========================================================================
+    
     def save_session(self, context: SessionContext) -> bool:
         """
-        Save or update session context in Redis.
-        Automatically sets TTL and updates session list.
+        Save session with write-through to both Redis and PostgreSQL.
+        
+        Flow:
+        1. Write to Redis (cache)
+        2. Write to PostgreSQL (persistence)
+        3. If this is first save (not persisted), create DB record
+        4. Otherwise, update DB record
         """
+        context.updated_at = datetime.utcnow()
+        
+        # Generate title if not set
+        if not context.title:
+            context.title = context.generate_title()
+        
+        success = True
+        
+        # 1. Write to Redis (cache layer)
         try:
-            context.updated_at = datetime.utcnow()
-            
-            # Generate title if not set
-            if not context.title:
-                context.title = context.generate_title()
-            
-            self._client.setex(
-                self._key(context.session_id),
+            self._redis.setex(
+                self._redis_key(context.session_id),
                 SESSION_TTL_SECONDS,
                 context.to_redis(),
             )
             
-            # Add to session list (sorted set with timestamp as score)
-            self._client.zadd(
+            # Update session list (sorted set)
+            self._redis.zadd(
                 REDIS_SESSION_LIST_KEY,
                 {context.session_id: context.updated_at.timestamp()},
             )
             
-            logger.info(
-                "SESSION_SAVED",
-                extra={
-                    "session_id": context.session_id,
-                    "turn_count": context.turn_count,
-                    "papers_cached": len(context.retrieved_papers),
-                },
+            logger.debug(
+                "SESSION_SAVED_REDIS",
+                extra={"session_id": context.session_id}
             )
-            return True
+        except Exception as e:
+            logger.error(
+                "SESSION_REDIS_SAVE_ERROR",
+                extra={"session_id": context.session_id, "error": str(e)}
+            )
+            success = False
+        
+        # 2. Write to PostgreSQL (persistence layer)
+        try:
+            # Check if session exists in DB
+            existing = self._db.get_session(context.session_id, include_messages=False)
+            
+            if existing is None:
+                # Session doesn't exist - create it
+                self._create_session_in_db(context)
+                logger.info(
+                    "SESSION_CREATED_IN_DB",
+                    extra={"session_id": context.session_id}
+                )
+            else:
+                # Session exists - update it
+                self._update_session_in_db(context)
+                logger.debug(
+                    "SESSION_UPDATED_IN_DB",
+                    extra={"session_id": context.session_id}
+                )
             
         except Exception as e:
             logger.error(
-                "SESSION_SAVE_ERROR",
-                extra={"session_id": context.session_id, "error": str(e)},
+                "SESSION_DB_SAVE_ERROR",
+                extra={"session_id": context.session_id, "error": str(e)}
             )
-            return False
+            success = False
+        
+        return success
+    
+    # ========================================================================
+    # CREATE SESSION (write to both immediately)
+    # ========================================================================
     
     def create_session(
         self,
         session_id: str,
         initial_message: Optional[str] = None,
         title: Optional[str] = None,
+        anonymous_id: Optional[str] = None,
     ) -> SessionContext:
         """
-        Create a new session.
+        Create a new session in both Redis and PostgreSQL.
         
         Args:
             session_id: UUID for the session
-            initial_message: Optional first message to store
+            initial_message: Optional first message
             title: Optional custom title
-            
+            anonymous_id: Optional user identifier
+        
         Returns:
             New SessionContext
         """
         now = datetime.utcnow()
+        
         context = SessionContext(
             session_id=session_id,
             original_query=initial_message or "",
@@ -126,24 +238,78 @@ class SessionService:
             turn_count=0,
             created_at=now,
             updated_at=now,
+            anonymous_id=anonymous_id,
+            persisted=False,  # Will be set to True after DB write
         )
         
         # Add initial user message if provided
         if initial_message:
             context.add_user_message(initial_message)
         
+        # Save to both Redis and PostgreSQL
         self.save_session(context)
+        
+        logger.info(
+            "SESSION_CREATED",
+            extra={
+                "session_id": session_id,
+                "anonymous_id": anonymous_id,
+            }
+        )
+        
         return context
     
-    def list_sessions(self, limit: int = 50, offset: int = 0) -> List[dict]:
+    # ========================================================================
+    # LIST SESSIONS (from Redis with DB fallback)
+    # ========================================================================
+    
+    def list_sessions(
+        self,
+        limit: int = 50,
+        offset: int = 0,
+        anonymous_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """
-        List all sessions sorted by last update time (newest first).
+        List sessions sorted by last update time (newest first).
         
-        Returns list of session summaries with id, title, updated_at.
+        Uses Redis session list, falls back to DB for expired sessions.
+        
+        Args:
+            limit: Maximum sessions to return
+            offset: Offset for pagination
+            anonymous_id: Optional filter by user
+        
+        Returns:
+            List of session summaries
         """
+        # For anonymous_id filtering, must use database
+        if anonymous_id:
+            try:
+                db_sessions = self._db.list_sessions(
+                    anonymous_id=anonymous_id,
+                    limit=limit,
+                    offset=offset,
+                )
+                return [
+                    {
+                        "session_id": s["id"],
+                        "title": s["title"],
+                        "updated_at": s["updated_at"],
+                        "message_count": s["message_count"],
+                    }
+                    for s in db_sessions
+                ]
+            except Exception as e:
+                logger.error(
+                    "SESSION_LIST_DB_ERROR",
+                    extra={"error": str(e)}
+                )
+                return []
+        
+        # Otherwise, use Redis session list (faster)
         try:
             # Get session IDs from sorted set (newest first)
-            session_ids = self._client.zrevrange(
+            session_ids = self._redis.zrevrange(
                 REDIS_SESSION_LIST_KEY,
                 offset,
                 offset + limit - 1,
@@ -162,95 +328,181 @@ class SessionService:
                         "message_count": len(context.messages),
                     })
                 else:
-                    # Session expired, mark for cleanup
+                    # Session expired from Redis, mark for cleanup
                     expired_ids.append(session_id)
             
-            # Clean up expired sessions from list
+            # Clean up expired sessions from Redis list
             if expired_ids:
-                self._client.zrem(REDIS_SESSION_LIST_KEY, *expired_ids)
+                self._redis.zrem(REDIS_SESSION_LIST_KEY, *expired_ids)
             
             return sessions
             
         except Exception as e:
             logger.error(
-                "SESSION_LIST_ERROR",
-                extra={"error": str(e)},
+                "SESSION_LIST_REDIS_ERROR",
+                extra={"error": str(e)}
             )
             return []
     
-    def update_session_title(self, session_id: str, title: str) -> bool:
-        """Update the title of a session."""
-        context = self.get_session(session_id)
-        if not context:
-            return False
-        
-        context.title = title
-        return self.save_session(context)
+    # ========================================================================
+    # DELETE SESSION (soft delete in DB, remove from Redis)
+    # ========================================================================
     
-    def add_message_to_session(
-        self,
-        session_id: str,
-        role: str,
-        content: Optional[str] = None,
-        answer: Optional[StructuredAnswer] = None,
-        metadata: Optional[dict] = None,
-    ) -> bool:
+    def delete_session(self, session_id: str) -> bool:
         """
-        Add a message to session history.
+        Delete session (soft delete in DB, remove from Redis).
         
         Args:
-            session_id: Session to update
-            role: 'user' or 'assistant'
-            content: Message content (for user messages)
-            answer: Structured answer (for assistant messages)
-            metadata: Optional metadata (for assistant messages)
+            session_id: Session to delete
+        
+        Returns:
+            True if deleted, False if not found
         """
-        context = self.get_session(session_id)
-        if not context:
-            return False
+        success = False
         
-        if role == "user":
-            context.add_user_message(content)
-        else:
-            context.add_assistant_message(answer, metadata)
+        # 1. Soft delete in PostgreSQL
+        try:
+            if self._db.delete_session(session_id):
+                success = True
+                logger.info(
+                    "SESSION_DELETED_DB",
+                    extra={"session_id": session_id}
+                )
+        except Exception as e:
+            logger.error(
+                "SESSION_DELETE_DB_ERROR",
+                extra={"session_id": session_id, "error": str(e)}
+            )
         
-        context.turn_count += 1
-        return self.save_session(context)
+        # 2. Remove from Redis
+        try:
+            self._redis.delete(self._redis_key(session_id))
+            self._redis.zrem(REDIS_SESSION_LIST_KEY, session_id)
+            logger.debug(
+                "SESSION_DELETED_REDIS",
+                extra={"session_id": session_id}
+            )
+        except Exception as e:
+            logger.warning(
+                "SESSION_DELETE_REDIS_ERROR",
+                extra={"session_id": session_id, "error": str(e)}
+            )
+        
+        return success
+    
+    # ========================================================================
+    # UTILITY METHODS
+    # ========================================================================
     
     def extend_ttl(self, session_id: str) -> bool:
-        """Extend TTL without modifying content (for Route C)."""
+        """Extend Redis TTL without modifying content."""
         try:
-            return bool(self._client.expire(self._key(session_id), SESSION_TTL_SECONDS))
+            return bool(self._redis.expire(
+                self._redis_key(session_id),
+                SESSION_TTL_SECONDS
+            ))
         except Exception as e:
             logger.error(
                 "SESSION_TTL_EXTEND_ERROR",
-                extra={"session_id": session_id, "error": str(e)},
+                extra={"session_id": session_id, "error": str(e)}
             )
             return False
     
-    def delete_session(self, session_id: str) -> bool:
-        """Manually invalidate a session."""
+    # ========================================================================
+    # INTERNAL HELPERS
+    # ========================================================================
+    
+    def _create_session_in_db(self, context: SessionContext):
+        """Create session in PostgreSQL (internal)."""
+        print(f"🔍 DEBUG: _create_session_in_db called for {context.session_id}")
+        
         try:
-            # Remove from session data
-            deleted = self._client.delete(self._key(session_id))
-            
-            # Remove from session list
-            self._client.zrem(REDIS_SESSION_LIST_KEY, session_id)
-            
-            logger.info(
-                "SESSION_DELETED",
-                extra={"session_id": session_id, "deleted": bool(deleted)},
+            # Create session record
+            result = self._db.create_session(
+                session_id=context.session_id,
+                anonymous_id=context.anonymous_id,
+                title=context.title,
+                original_query=context.original_query,
+                query_embedding=context.query_embedding if context.query_embedding else None,
             )
-            return bool(deleted)
+            print(f"✅ DEBUG: Session created in DB: {result}")
+            
+            # Add messages
+            for i, msg in enumerate(context.messages):
+                print(f"🔍 DEBUG: Adding message {i+1}/{len(context.messages)}")
+                self._db.add_message(
+                    session_id=context.session_id,
+                    role=msg.role,
+                    content=msg.content,
+                    answer=msg.answer.to_dict() if msg.answer else None,
+                    metadata=msg.metadata,
+                )
+            print(f"✅ DEBUG: {len(context.messages)} messages added")
+            
         except Exception as e:
-            logger.error(
-                "SESSION_DELETE_ERROR",
-                extra={"session_id": session_id, "error": str(e)},
+            print(f"❌ DEBUG: Exception in _create_session_in_db: {e}")
+            import traceback
+            traceback.print_exc()
+            raise
+    
+    def _update_session_in_db(self, context: SessionContext):
+        """Update session in PostgreSQL (internal)."""
+        # Update session metadata
+        self._db.update_session(
+            session_id=context.session_id,
+            title=context.title,
+            original_query=context.original_query,
+            query_embedding=context.query_embedding if context.query_embedding else None,
+        )
+        
+        # Get existing message count
+        existing_count = self._db.get_session(context.session_id, include_messages=False)
+        if existing_count:
+            existing_msg_count = existing_count.get("message_count", 0)
+        else:
+            existing_msg_count = 0
+        
+        # Add any new messages (only messages after existing_count)
+        new_messages = context.messages[existing_msg_count:]
+        for msg in new_messages:
+            self._db.add_message(
+                session_id=context.session_id,
+                role=msg.role,
+                content=msg.content,
+                answer=msg.answer.to_dict() if msg.answer else None,
+                metadata=msg.metadata,
             )
-            return False
+    
+    def _db_record_to_session_context(
+        self,
+        db_session: Dict[str, Any]
+    ) -> SessionContext:
+        """Convert database record to SessionContext (internal)."""
+        # Convert messages
+        messages = []
+        for db_msg in db_session.get("messages", []):
+            messages.append(SessionMessage.from_db_dict(db_msg))
+        
+        # Create SessionContext
+        return SessionContext(
+            session_id=db_session["id"],
+            anonymous_id=db_session.get("anonymous_id"),
+            title=db_session.get("title"),
+            original_query=db_session.get("original_query", ""),
+            query_embedding=db_session.get("query_embedding", []),
+            messages=messages,
+            turn_count=db_session.get("turn_count", len(messages)),
+            created_at=db_session["created_at"],
+            updated_at=db_session["updated_at"],
+            deleted_at=db_session.get("deleted_at"),
+            persisted=True,  # Came from DB, so it's persisted
+        )
 
 
+# ============================================================================
 # Module-level singleton
+# ============================================================================
+
 _session_service: Optional[SessionService] = None
 
 
