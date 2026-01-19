@@ -13,6 +13,7 @@ from pydantic import BaseModel, Field
 from contextlib import asynccontextmanager
 from typing import Optional, Generator
 import os
+from datetime import datetime
 import uuid
 import json
 import asyncpg
@@ -46,6 +47,7 @@ from app.schemas.api import (
     ReviewRequest,
     ReviewResponse,
 )
+from app.schemas.session import StructuredAnswer, AnswerSection, SessionContext
 
 # --- Configuration ---
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://aesop:aesop_pass@postgres:5432/aesop_db")
@@ -175,12 +177,18 @@ def create_session(request: CreateSessionRequest = None):
         # Get or create session context
         context = session_service.get_session(session_id)
         if not context:
-            context = session_service.create_session(
+            # Create empty session context (no messages yet)
+            context = SessionContext(
                 session_id=session_id,
-                initial_message=request.initial_message,
+                original_query=request.initial_message,
+                title=None,
+                messages=[],
+                turn_count=0,
+                created_at=datetime.utcnow(),
+                updated_at=datetime.utcnow(),
             )
         
-        # Add messages to history
+        # Add messages to history (only once)
         context.add_user_message(request.initial_message)
         context.add_assistant_message(
             answer=result["structured_answer"],
@@ -193,9 +201,11 @@ def create_session(request: CreateSessionRequest = None):
                 avg_quality=result.get("avg_quality"),
             ),
         )
+        
+        # Save session with messages
         session_service.save_session(context)
-
-        # 🆕 Save research context to PostgreSQL (if research was done)
+        
+        # Save research context to PostgreSQL (if research was done)
         if result.get("route_taken") in ["full_graph", "augmented_context"]:
             _save_research_to_db(session_id, result)
         
@@ -218,7 +228,7 @@ def create_session(request: CreateSessionRequest = None):
             initial_response=initial_response,
         )
     else:
-        # Create empty session
+        # Create empty session (no initial message)
         context = session_service.create_session(session_id=session_id)
         
         return CreateSessionResponse(
@@ -226,6 +236,7 @@ def create_session(request: CreateSessionRequest = None):
             created_at=context.created_at,
             title=None,
         )
+
 
 
 @app.get("/sessions", response_model=ListSessionsResponse, tags=["Sessions"])
@@ -383,7 +394,7 @@ def send_message(session_id: str, request: SendMessageRequest):
     session = session_service.get_session(session_id)
     if not session:
         raise HTTPException(status_code=404, detail="Session not found or expired")
-    
+        
     try:
         # Process the message
         result = run_orchestrated_review(
@@ -391,10 +402,13 @@ def send_message(session_id: str, request: SendMessageRequest):
             session_id=session_id,
         )
         
-        # Refresh session (may have been updated by orchestrator)
+        # ✅ FIXED: Refresh session from cache/DB (may have been updated by orchestrator)
         session = session_service.get_session(session_id)
+        if not session:
+            # Session was deleted or expired during processing
+            raise HTTPException(status_code=404, detail="Session expired during processing")
         
-        # Add messages to history
+        # ✅ FIXED: Add messages to history (only once)
         session.add_user_message(request.message)
         session.add_assistant_message(
             answer=result["structured_answer"],
@@ -408,16 +422,21 @@ def send_message(session_id: str, request: SendMessageRequest):
             ),
         )
         
-        # Update original query if this is first real message
-        if not session.original_query:
-            session.original_query = request.message
-            session.title = session.generate_title()
-        
-        session_service.save_session(session)
-
-        # 🆕 Save research context to PostgreSQL (if research was done)
+        # Update session with new papers if research was done
         if result.get("route_taken") in ["full_graph", "augmented_context"]:
+            if result.get("merged_papers"):
+                # Update retrieved_papers (merge with existing)
+                existing_pmids = {p.pmid for p in session.retrieved_papers}
+                for paper in result["merged_papers"]:
+                    if paper.pmid not in existing_pmids:
+                        session.retrieved_papers.append(paper)
+                        existing_pmids.add(paper.pmid)
+            
+            # Save research context to DB
             _save_research_to_db(session_id, result)
+        
+        # Save updated session
+        session_service.save_session(session)
         
         return MessageResponse(
             answer=result["structured_answer"],
@@ -430,7 +449,7 @@ def send_message(session_id: str, request: SendMessageRequest):
                 evidence_score=result.get("avg_quality"),
             ),
         )
-        
+    
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -544,29 +563,38 @@ def _save_research_to_db(session_id: str, result: dict):
     """
     Save research context and papers to PostgreSQL.
     Called after orchestrated review for research routes.
+    
+    FIXED: Handle StructuredAnswer as Pydantic object, not dict
     """
     from app.services.database import get_database_service
     from app.embeddings.bedrock import embed_query
+    from app.logging import logger  # ✅ FIXED: Import logger
     
     db = get_database_service()
     
     try:
-        # Get query and create embedding
-        query = result.get("structured_answer", {}).get("sections", [{}])[0].get("content", "")[:200]
+        # ✅ FIXED: Get query from StructuredAnswer Pydantic object
+        # result["structured_answer"] is a StructuredAnswer object, not a dict
+        structured_answer = result.get("structured_answer")
+        if structured_answer and structured_answer.sections:
+            # Access sections as a list of AnswerSection objects
+            query = structured_answer.sections[0].content[:200]
+        else:
+            query = result.get("original_query", "")[:200]
+        
         query_embedding = None
         
-        # Create research context
         context_id = db.create_research_context(
             session_id=session_id,
-            research_query=query,
+            query=query,  # ✅ Correct parameter name
             query_embedding=query_embedding,
             synthesis_summary=result.get("response", ""),
             route_taken=result.get("route_taken"),
             intent=result.get("intent"),
-            intent_confidence=result.get("intent_confidence"),
             papers_count=result.get("papers_count", 0),
             critic_decision=result.get("critic_decision"),
             avg_quality=result.get("avg_quality"),
+            discard_ratio=result.get("discard_ratio"),  # ✅ Added
         )
         
         # Save papers if available
@@ -608,6 +636,7 @@ def _save_research_to_db(session_id: str, result: dict):
             )
     
     except Exception as e:
+        # ✅ FIXED: logger is now imported
         logger.error(
             "RESEARCH_SAVE_TO_DB_FAILED",
             extra={
@@ -616,6 +645,7 @@ def _save_research_to_db(session_id: str, result: dict):
             }
         )
         # Don't fail the request if DB save fails
+
 
 # =============================================================================
 # LEGACY ENDPOINTS (DEPRECATED - MAINTAINED FOR BACKWARD COMPATIBILITY)

@@ -4,7 +4,7 @@ Matches schema from 002_create_session_tables.sql
 
 Tables:
 - sessions (not conversations)
-- messages (with JSONB answer/metadata)
+- messages (with JSONB structured_answer/metadata)
 - research_contexts
 - research_papers
 """
@@ -186,15 +186,24 @@ class DatabaseService:
         """
         Get session by ID.
         Returns None if not found or soft-deleted.
+        
+        FIXED: Removed turn_count and message_count from SELECT (they don't exist in schema).
+        Instead, we compute message_count dynamically.
         """
         with self.get_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                # Get session with computed message_count
                 cur.execute(
                     """
-                    SELECT id, anonymous_id, title, original_query, query_embedding,
-                           turn_count, message_count, created_at, updated_at, deleted_at
-                    FROM sessions
-                    WHERE id = %s AND deleted_at IS NULL
+                    SELECT s.id, s.anonymous_id, s.title, s.original_query, 
+                           s.query_embedding, s.synthesis_summary,
+                           s.created_at, s.updated_at, s.deleted_at,
+                           COALESCE(
+                               (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id),
+                               0
+                           ) AS message_count
+                    FROM sessions s
+                    WHERE s.id = %s AND s.deleted_at IS NULL
                     """,
                     (session_id,)
                 )
@@ -209,14 +218,17 @@ class DatabaseService:
                 if include_messages:
                     cur.execute(
                         """
-                        SELECT id, session_id, role, content, answer, metadata, created_at
+                        SELECT id, session_id, role, content, 
+                               structured_answer, metadata, sequence_num, created_at
                         FROM messages
                         WHERE session_id = %s
-                        ORDER BY created_at ASC
+                        ORDER BY sequence_num ASC
                         """,
                         (session_id,)
                     )
                     session["messages"] = [dict(msg) for msg in cur.fetchall()]
+                else:
+                    session["messages"] = []
                 
                 return session
     
@@ -229,16 +241,22 @@ class DatabaseService:
         """
         List sessions, optionally filtered by anonymous_id.
         Returns list of session summaries sorted by updated_at DESC.
+        
+        FIXED: Compute message_count dynamically using subquery.
         """
         with self.get_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 if anonymous_id:
                     cur.execute(
                         """
-                        SELECT id, title, updated_at, created_at, message_count
-                        FROM sessions
-                        WHERE anonymous_id = %s AND deleted_at IS NULL
-                        ORDER BY updated_at DESC
+                        SELECT s.id, s.title, s.updated_at, s.created_at,
+                               COALESCE(
+                                   (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id),
+                                   0
+                               ) AS message_count
+                        FROM sessions s
+                        WHERE s.anonymous_id = %s AND s.deleted_at IS NULL
+                        ORDER BY s.updated_at DESC
                         LIMIT %s OFFSET %s
                         """,
                         (anonymous_id, limit, offset)
@@ -246,10 +264,14 @@ class DatabaseService:
                 else:
                     cur.execute(
                         """
-                        SELECT id, title, updated_at, created_at, message_count
-                        FROM sessions
-                        WHERE deleted_at IS NULL
-                        ORDER BY updated_at DESC
+                        SELECT s.id, s.title, s.updated_at, s.created_at,
+                               COALESCE(
+                                   (SELECT COUNT(*) FROM messages m WHERE m.session_id = s.id),
+                                   0
+                               ) AS message_count
+                        FROM sessions s
+                        WHERE s.deleted_at IS NULL
+                        ORDER BY s.updated_at DESC
                         LIMIT %s OFFSET %s
                         """,
                         (limit, offset)
@@ -325,7 +347,7 @@ class DatabaseService:
                 return deleted
     
     # ========================================================================
-    # MESSAGES CRUD (with JSONB answer and metadata)
+    # MESSAGES CRUD (with JSONB structured_answer and metadata)
     # ========================================================================
     
     def add_message(
@@ -333,7 +355,7 @@ class DatabaseService:
         session_id: str,
         role: str,
         content: Optional[str] = None,
-        answer: Optional[Dict[str, Any]] = None,
+        answer: Optional[Dict[str, Any]] = None,  # Will be stored as structured_answer
         metadata: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
@@ -347,19 +369,31 @@ class DatabaseService:
             metadata: Metadata dict (for assistant messages)
         
         Returns: Message record as dict
+        
+        FIXED: Use structured_answer column (not answer) and sequence_num
         """
         message_id = str(uuid.uuid4())
         
         with self.get_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
                 try:
+                    # Get next sequence number
+                    cur.execute(
+                        "SELECT get_next_message_sequence(%s) AS seq",
+                        (session_id,)
+                    )
+                    sequence_num = cur.fetchone()["seq"]
+                    
+                    # Insert message
                     cur.execute(
                         """
                         INSERT INTO messages (
-                            id, session_id, role, content, answer, metadata, created_at
+                            id, session_id, role, content, 
+                            structured_answer, metadata, sequence_num, created_at
                         )
-                        VALUES (%s, %s, %s, %s, %s, %s, NOW())
-                        RETURNING id, session_id, role, content, answer, metadata, created_at
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, NOW())
+                        RETURNING id, session_id, role, content, 
+                                  structured_answer, metadata, sequence_num, created_at
                         """,
                         (
                             message_id,
@@ -368,6 +402,7 @@ class DatabaseService:
                             content,
                             Json(answer) if answer else None,
                             Json(metadata) if metadata else None,
+                            sequence_num,
                         )
                     )
                     row = cur.fetchone()
@@ -378,6 +413,7 @@ class DatabaseService:
                             "session_id": session_id,
                             "role": role,
                             "message_id": message_id,
+                            "sequence_num": sequence_num,
                         }
                     )
                     
@@ -407,6 +443,8 @@ class DatabaseService:
             limit: Optional limit (e.g., last N messages)
         
         Returns: List of message dicts
+        
+        FIXED: Use structured_answer and sequence_num columns
         """
         with self.get_connection() as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -414,10 +452,11 @@ class DatabaseService:
                     # Get last N messages
                     cur.execute(
                         """
-                        SELECT id, session_id, role, content, answer, metadata, created_at
+                        SELECT id, session_id, role, content, 
+                               structured_answer, metadata, sequence_num, created_at
                         FROM messages
                         WHERE session_id = %s
-                        ORDER BY created_at DESC
+                        ORDER BY sequence_num DESC
                         LIMIT %s
                         """,
                         (session_id, limit)
@@ -428,10 +467,11 @@ class DatabaseService:
                     # Get all messages
                     cur.execute(
                         """
-                        SELECT id, session_id, role, content, answer, metadata, created_at
+                        SELECT id, session_id, role, content, 
+                               structured_answer, metadata, sequence_num, created_at
                         FROM messages
                         WHERE session_id = %s
-                        ORDER BY created_at ASC
+                        ORDER BY sequence_num ASC
                         """,
                         (session_id,)
                     )
@@ -444,19 +484,21 @@ class DatabaseService:
     def create_research_context(
         self,
         session_id: str,
-        research_query: str,
+        query: str,
         query_embedding: Optional[List[float]] = None,
         synthesis_summary: Optional[str] = None,
         route_taken: Optional[str] = None,
         intent: Optional[str] = None,
-        intent_confidence: Optional[float] = None,
         papers_count: int = 0,
         critic_decision: Optional[str] = None,
         avg_quality: Optional[float] = None,
+        discard_ratio: Optional[float] = None,
     ) -> str:
         """
         Create a research context.
         Returns: research_context_id
+        
+        FIXED: Column is 'query' not 'research_query'
         """
         context_id = str(uuid.uuid4())
         
@@ -465,17 +507,17 @@ class DatabaseService:
                 cur.execute(
                     """
                     INSERT INTO research_contexts (
-                        id, session_id, research_query, query_embedding,
-                        synthesis_summary, route_taken, intent, intent_confidence,
-                        papers_count, critic_decision, avg_quality, created_at
+                        id, session_id, query, query_embedding,
+                        synthesis_summary, route_taken, intent,
+                        papers_count, critic_decision, avg_quality, discard_ratio, created_at
                     )
                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
                     RETURNING id
                     """,
                     (
-                        context_id, session_id, research_query, query_embedding,
-                        synthesis_summary, route_taken, intent, intent_confidence,
-                        papers_count, critic_decision, avg_quality
+                        context_id, session_id, query, query_embedding,
+                        synthesis_summary, route_taken, intent,
+                        papers_count, critic_decision, avg_quality, discard_ratio
                     )
                 )
                 
@@ -511,11 +553,9 @@ class DatabaseService:
                         INSERT INTO research_papers (
                             id, research_context_id, pmid, title, abstract,
                             publication_year, journal, relevance_score,
-                            methodology_score, quality_score, recommendation,
-                            study_type, created_at
+                            methodology_score, quality_score, recommendation, created_at
                         )
-                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
-                        ON CONFLICT (research_context_id, pmid) DO NOTHING
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, NOW())
                         """,
                         (
                             paper_id,
@@ -529,7 +569,6 @@ class DatabaseService:
                             paper.get("methodology_score"),
                             paper.get("quality_score"),
                             paper.get("recommendation"),
-                            paper.get("study_type"),
                         )
                     )
                 

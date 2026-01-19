@@ -18,6 +18,7 @@ backend/app/services/session.py
 import redis
 from typing import Optional, List, Dict, Any
 from datetime import datetime
+import traceback
 
 from app.schemas.session import (
     SessionContext,
@@ -142,6 +143,8 @@ class SessionService:
         2. Write to PostgreSQL (persistence)
         3. If this is first save (not persisted), create DB record
         4. Otherwise, update DB record
+        
+        FIXED: Better handling of existing sessions
         """
         context.updated_at = datetime.utcnow()
         
@@ -178,32 +181,56 @@ class SessionService:
         
         # 2. Write to PostgreSQL (persistence layer)
         try:
-            # Check if session exists in DB
-            existing = self._db.get_session(context.session_id, include_messages=False)
+            # ✅ FIXED: Check if session exists in DB using direct query
+            with self._db.get_connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT id FROM sessions WHERE id = %s AND deleted_at IS NULL",
+                        (context.session_id,)
+                    )
+                    session_exists = cur.fetchone() is not None
             
-            if existing is None:
+            logger.debug(
+                "SESSION_DB_CHECK",
+                extra={
+                    "session_id": context.session_id,
+                    "exists": session_exists,
+                    "message_count": len(context.messages),
+                }
+            )
+            
+            if not session_exists:
                 # Session doesn't exist - create it
                 self._create_session_in_db(context)
                 logger.info(
                     "SESSION_CREATED_IN_DB",
-                    extra={"session_id": context.session_id}
+                    extra={
+                        "session_id": context.session_id,
+                        "message_count": len(context.messages),
+                    }
                 )
             else:
                 # Session exists - update it
                 self._update_session_in_db(context)
                 logger.debug(
                     "SESSION_UPDATED_IN_DB",
-                    extra={"session_id": context.session_id}
+                    extra={
+                        "session_id": context.session_id,
+                        "message_count": len(context.messages),
+                    }
                 )
             
         except Exception as e:
             logger.error(
                 "SESSION_DB_SAVE_ERROR",
-                extra={"session_id": context.session_id, "error": str(e)}
+                extra={
+                    "session_id": context.session_id,
+                    "error": str(e),
+                    "traceback": traceback.format_exc(),
+                }
             )
             success = False
-        
-        return success
+
     
     # ========================================================================
     # CREATE SESSION (write to both immediately)
@@ -447,6 +474,8 @@ class SessionService:
     
     def _update_session_in_db(self, context: SessionContext):
         """Update session in PostgreSQL (internal)."""
+        print(f"🔍 DEBUG: _update_session_in_db called for {context.session_id}")
+        
         # Update session metadata
         self._db.update_session(
             session_id=context.session_id,
@@ -455,16 +484,19 @@ class SessionService:
             query_embedding=context.query_embedding if context.query_embedding else None,
         )
         
-        # Get existing message count
-        existing_count = self._db.get_session(context.session_id, include_messages=False)
-        if existing_count:
-            existing_msg_count = existing_count.get("message_count", 0)
+        # Get existing messages from DB
+        existing_session = self._db.get_session(context.session_id, include_messages=True)
+        if existing_session and existing_session.get("messages"):
+            existing_msg_count = len(existing_session["messages"])
         else:
             existing_msg_count = 0
         
+        print(f"🔍 DEBUG: Existing messages in DB: {existing_msg_count}, Current messages: {len(context.messages)}")
+        
         # Add any new messages (only messages after existing_count)
         new_messages = context.messages[existing_msg_count:]
-        for msg in new_messages:
+        for i, msg in enumerate(new_messages):
+            print(f"🔍 DEBUG: Adding new message {i+1}/{len(new_messages)} role={msg.role}")
             self._db.add_message(
                 session_id=context.session_id,
                 role=msg.role,
@@ -472,6 +504,9 @@ class SessionService:
                 answer=msg.answer.to_dict() if msg.answer else None,
                 metadata=msg.metadata,
             )
+        
+        print(f"✅ DEBUG: {len(new_messages)} new messages added to DB")
+
     
     def _db_record_to_session_context(
         self,
@@ -483,6 +518,9 @@ class SessionService:
         for db_msg in db_session.get("messages", []):
             messages.append(SessionMessage.from_db_dict(db_msg))
         
+        # Compute turn_count from messages (count user messages)
+        turn_count = sum(1 for msg in messages if msg.role == "user")
+        
         # Create SessionContext
         return SessionContext(
             session_id=db_session["id"],
@@ -491,7 +529,7 @@ class SessionService:
             original_query=db_session.get("original_query", ""),
             query_embedding=db_session.get("query_embedding", []),
             messages=messages,
-            turn_count=db_session.get("turn_count", len(messages)),
+            turn_count=turn_count,  # FIXED: Computed from messages
             created_at=db_session["created_at"],
             updated_at=db_session["updated_at"],
             deleted_at=db_session.get("deleted_at"),

@@ -74,14 +74,18 @@ class SessionMessage(BaseModel):
     @classmethod
     def from_db_dict(cls, data: Dict[str, Any]) -> "SessionMessage":
         """Create from database dict."""
+        # Handle both 'answer' and 'structured_answer' column names
+        answer_data = data.get("structured_answer") or data.get("answer")
+        
         return cls(
             id=data.get("id"),
             role=data["role"],
             content=data.get("content"),
-            answer=StructuredAnswer.from_dict(data["answer"]) if data.get("answer") else None,
+            answer=StructuredAnswer.from_dict(answer_data) if answer_data else None,
             metadata=data.get("metadata"),
             timestamp=data.get("created_at", datetime.utcnow()),
         )
+
 
 
 class SessionContext(BaseModel):

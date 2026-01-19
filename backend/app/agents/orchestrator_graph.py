@@ -27,7 +27,7 @@ from app.agents.synthesizer.agent import synthesizer_node as original_synthesize
 from app.agents.context_qa.node import context_qa_node
 
 from app.schemas.session import SessionContext, CachedPaper
-from app.services.session import get_session_service
+from app.services.session import get_session_service, SESSION_TTL_SECONDS
 from app.embeddings.bedrock import embed_query
 from app.logging import logger
 
@@ -266,10 +266,10 @@ def save_session_node(state: OrchestratorState) -> OrchestratorState:
     existing = state.session_context
     turn_count = (existing.turn_count + 1) if existing else 1
     created_at = existing.created_at if existing else datetime.utcnow()
-    
+
     # Truncate synthesis for caching
     synthesis_summary = (state.synthesis_output or "")[:1500]
-    
+
     context = SessionContext(
         session_id=session_id,
         original_query=query,
@@ -279,10 +279,26 @@ def save_session_node(state: OrchestratorState) -> OrchestratorState:
         turn_count=turn_count,
         created_at=created_at,
     )
-    
-    session_service.save_session(context)
-    
+
+    # Only cache in Redis (don't save to DB - main.py will do it with messages)
+    try:
+        session_service._redis.setex(
+            session_service._redis_key(session_id),
+            SESSION_TTL_SECONDS,
+            context.to_redis(),
+        )
+        logger.debug(
+            "SESSION_CONTEXT_CACHED_REDIS",
+            extra={"session_id": session_id}
+        )
+    except Exception as e:
+        logger.warning(
+            "SESSION_CONTEXT_CACHE_ERROR",
+            extra={"session_id": session_id, "error": str(e)}
+        )
+
     return state
+
 
 
 # ============================
